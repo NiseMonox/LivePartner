@@ -40,6 +40,12 @@ personas/user_*.yaml
 *.log
 logs/
 
+# Demo / scratch artifacts
+demo_*.mp3
+demo_*.wav
+demo_*.png
+.git_commit_msg.tmp
+
 # Secrets
 *.key
 .env

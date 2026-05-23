@@ -25,6 +25,7 @@ from PIL import Image, ImageDraw, ImageFont
 from livepartner.decision import decide, gate, generate
 from livepartner.llm import encode_image
 from livepartner.persona import load_persona
+from livepartner.tts import synthesize_for_persona
 
 
 def synth_you_died_frame(size: tuple[int, int] = (1280, 720)) -> Image.Image:
@@ -83,6 +84,8 @@ def main() -> int:
     ap.add_argument("--persona", default="snark")
     ap.add_argument("--image", type=Path, help="path to a game frame (PNG/JPG); default = synthesized YOU DIED")
     ap.add_argument("--event", default="玩家在 boss 战中第三次死亡。画面切换为 YOU DIED 红屏。BGM 转为低沉死亡音乐。")
+    ap.add_argument("--tts-out", type=Path, default=Path("demo_tts.mp3"),
+                    help="where to write TTS mp3; pass empty string to skip TTS")
     args = ap.parse_args()
 
     persona = load_persona(args.persona)
@@ -121,6 +124,16 @@ def main() -> int:
     print(f"  AI ({persona.display_name}) > {reply.text}")
     print()
     print(f"total LLM latency: {dt_gate + dt_gen:.0f} ms")
+
+    # Stage 3: TTS
+    if str(args.tts_out):
+        t0 = time.perf_counter()
+        tts = synthesize_for_persona(reply.text, persona)
+        dt_tts = (time.perf_counter() - t0) * 1000
+        args.tts_out.write_bytes(tts.mp3)
+        print()
+        print(f"[tts]       {dt_tts:.0f} ms  voice={tts.voice_id}  rate={tts.rate}  chars={tts.char_count}")
+        print(f"  saved {len(tts.mp3) // 1024} KB mp3 to {args.tts_out}")
     return 0
 
 
