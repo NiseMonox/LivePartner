@@ -86,6 +86,8 @@ def main() -> int:
     ap.add_argument("--event", default="玩家在 boss 战中第三次死亡。画面切换为 YOU DIED 红屏。BGM 转为低沉死亡音乐。")
     ap.add_argument("--tts-out", type=Path, default=Path("demo_tts.mp3"),
                     help="where to write TTS mp3; pass empty string to skip TTS")
+    ap.add_argument("--force-speak", action="store_true",
+                    help="skip the LLM gate (use for high-priority events like death)")
     args = ap.parse_args()
 
     persona = load_persona(args.persona)
@@ -105,11 +107,16 @@ def main() -> int:
     print(f"frame_b64 size: {len(frame_b64) // 1024} KB,  thumb_b64 size: {len(thumb_b64) // 1024} KB")
     print()
 
-    # Stage 1
-    t0 = time.perf_counter()
-    speak = gate(args.event, thumb_b64, persona)
-    dt_gate = (time.perf_counter() - t0) * 1000
-    print(f"[gate]      speak={speak}  ({dt_gate:.0f} ms)")
+    # Stage 1: gate (skip if force_speak)
+    dt_gate = 0.0
+    if args.force_speak:
+        print("[gate]      skipped (force_speak)")
+        speak = True
+    else:
+        t0 = time.perf_counter()
+        speak = gate(args.event, thumb_b64, persona)
+        dt_gate = (time.perf_counter() - t0) * 1000
+        print(f"[gate]      speak={speak}  ({dt_gate:.0f} ms)")
 
     if not speak:
         print("\nAI 选择沉默。")

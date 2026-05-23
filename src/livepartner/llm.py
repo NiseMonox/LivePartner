@@ -23,8 +23,12 @@ def chat(
     image_b64: str | None = None,
     mime: str = "image/png",
     max_tokens: int = 300,
+    extra_body: dict[str, Any] | None = None,
 ) -> str:
-    """One call surface for everything: text-only or vision, flash or pro."""
+    """One call surface for everything: text-only or vision, flash or pro.
+
+    extra_body lets callers pass DashScope-specific params (e.g. enable_thinking=False).
+    """
     messages: list[dict[str, Any]] = []
     if system:
         messages.append({"role": "system", "content": system})
@@ -38,10 +42,15 @@ def chat(
         ]
     messages.append({"role": "user", "content": user_content})
 
+    extra: dict[str, Any] = {}
+    if extra_body:
+        extra["extra_body"] = extra_body
+
     resp = client().chat.completions.create(
         model=model,
         messages=messages,
         max_tokens=max_tokens,
+        **extra,
     )
     return resp.choices[0].message.content or ""
 
