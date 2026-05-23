@@ -118,8 +118,8 @@
 │  │  │ 信号层：SSIM / CLIP / HUD / OCR /        │    │ │
 │  │  │         RMS / 频谱 / BGM 检测            │    │ │
 │  │  ├──────────────────────────────────────────┤    │ │
-│  │  │ 决策层：事件融合 → 沉默规则 → DeepSeek   │    │ │
-│  │  │       （V4 Flash gate + V4 Pro generate）│    │ │
+│  │  │ 决策层：事件融合 → 沉默规则 → Qwen       │    │ │
+│  │  │ （Omni Flash gate + Omni Plus generate） │    │ │
 │  │  ├──────────────────────────────────────────┤    │ │
 │  │  │ 记忆系统：markdown 读写                  │    │ │
 │  │  ├──────────────────────────────────────────┤    │ │
@@ -179,8 +179,8 @@ t=80ms    SSIM 检测到大变化 + OCR 命中 "YOU DIED"
           音频信号检测到 BGM mood = "death"
 t=100ms   事件总线收到 [hud:death, audio:bgm_death]，importance=0.95
 t=120ms   沉默规则放行（损友人格 cooldown 已过，死亡是高优触发）
-t=130ms   DeepSeek V4 Flash 预筛：should_speak=true（耗时 200ms）
-t=350ms   DeepSeek V4 Pro 生成台词（含最近 3 帧 + 记忆）
+t=130ms   Qwen Omni Flash 预筛：should_speak=true（耗时 200ms）
+t=350ms   Qwen Omni Plus 生成台词（含最近 3 帧 + 记忆）
 t=1300ms  返回 {text: "哎呦，第几次了我都数不清了", emotion: smirk}
 t=1320ms  TTS server 收到，GPT-SoVITS 流式合成（首块 300ms）
 t=1620ms  首块 PCM 到达，写入 Mumble bot TX 队列
@@ -276,7 +276,7 @@ class SilenceController:
 #### 5.3.3 LLM 调用策略（两段）
 
 ```python
-# 段 1: DeepSeek V4 Flash 二分类（~$0.001）
+# 段 1: Qwen Omni Flash 二分类（~$0.001）
 gate = flash.invoke(
     system=PERSONA_GATE_PROMPT,
     messages=[{"role": "user", "content": [
@@ -287,7 +287,7 @@ gate = flash.invoke(
 )
 
 if gate["should_speak"]:
-    # 段 2: DeepSeek V4 Pro 生成
+    # 段 2: Qwen Omni Plus 生成
     response = pro.invoke(
         system=full_persona_prompt + memory_files,   # 稳定前缀触发上下文缓存
         messages=[{"role": "user", "content": [
@@ -301,12 +301,12 @@ if gate["should_speak"]:
     # 输出: {text, emotion, vts_expression, memory_update}
 ```
 
-**上下文缓存**：DeepSeek API 对相同前缀的输入自动命中缓存（KV cache hit），system prompt（人格 + 记忆）保持稳定前缀以最大化命中率，输入成本显著降低。
+**上下文缓存**：Qwen / DashScope 支持对长稳定前缀的输入命中缓存，system prompt（人格 + 记忆）维持稳定前缀以最大化命中率，输入成本显著降低。
 
 #### 5.3.4 记忆读写
-- **读**：每次 DeepSeek V4 Pro 调用前组装 `global/player.md` + 当前游戏的 `identity.md` + `observed.md`（最近 30 条）+ `jokes.md` + `progress.md`，总 token < 4K
-- **写**：V4 Pro 输出的 `memory_update` 字段异步追加到 `observed.md`
-- **会话末**：游戏退出或人格切换时，V4 Flash 把当日小结写 `sessions/<date>.md` 并更新 `highlights.md` / `progress.md`
+- **读**：每次 Qwen Omni Plus 调用前组装 `global/player.md` + 当前游戏的 `identity.md` + `observed.md`（最近 30 条）+ `jokes.md` + `progress.md`，总 token < 4K
+- **写**：Omni Plus 输出的 `memory_update` 字段异步追加到 `observed.md`
+- **会话末**：游戏退出或人格切换时，Omni Flash 把当日小结写 `sessions/<date>.md` 并更新 `highlights.md` / `progress.md`
 
 ### 5.4 输出层
 
@@ -327,7 +327,7 @@ if gate["should_speak"]:
   - `MouthOpenY`：TTS 音频 RMS（每 50ms）
   - `MouthForm`：中文五元音粗映射
   - `FaceAngleX/Y/Z`：idle 微动画
-  - 表情参数：按 V4 Pro 输出的 `vts_expression` 切换
+  - 表情参数：按 Omni Plus 输出的 `vts_expression` 切换
 
 #### 5.4.4 字幕浮窗
 - PySide6 `QWidget` + frameless + 透明背景 + 置顶
@@ -380,8 +380,8 @@ if gate["should_speak"]:
 ```
 
 ### 6.3 写入策略
-- V4 Pro 输出 `memory_update` → 异步 append
-- 每 50 条用 V4 Flash 压缩归档
+- Omni Plus 输出 `memory_update` → 异步 append
+- 每 50 条用 Omni Flash 压缩归档
 - 防剧透：`progress.md` 显式标记"已知到第 N 章"，prompt 强约束 AI 不引用未来内容
 
 ### 6.4 读取策略
@@ -543,9 +543,9 @@ OBS 场景（笔记本）
 - 常驻基线：TTS 3GB + VTS 1GB = 4GB
 - 加 STT 按需：4GB + 3GB = 7GB（紧但够）
 - 直播时加 OBS：+1GB → 8GB（极限，需关 VLM 预筛）
-- VLM 预筛不与 STT 同时加载；直播时直接禁用，预筛改走 DeepSeek V4 Flash 远程
+- VLM 预筛不与 STT 同时加载；直播时直接禁用，预筛改走 Qwen Omni Flash 远程
 
-**结论**：4070 8GB 跑得下，但 VLM 预筛建议不上本地，用 DeepSeek V4 Flash 远程做。
+**结论**：4070 8GB 跑得下，但 VLM 预筛建议不上本地，用 Qwen Omni Flash 远程做。
 
 ### 10.2 TTS 服务接口
 
@@ -604,12 +604,12 @@ LivePartner 启动时自动确保 "LivePartner" 频道存在，bot 加入此频�
 ### 11.2 LLM 月成本（每天 2 小时游戏）
 | 项 | 单价 | 频率 | 月成本 |
 |---|---|---|---|
-| V4 Flash 预筛 | 待核（≤ ¥0.001/次） | 60 次/小时 | ≤ ¥3-5 |
-| V4 Pro 生成（含图） | 待核（≤ ¥0.05/次） | 15-25 次/小时 | ≤ ¥45-80 |
-| 会话末总结（V4 Flash） | 待核（≤ ¥0.01/次） | 2 次/天 | ≤ ¥0.6 |
+| Omni Flash 预筛 | 待核（≤ ¥0.001/次） | 60 次/小时 | ≤ ¥3-5 |
+| Omni Plus 生成（含图） | 待核（≤ ¥0.05/次） | 15-25 次/小时 | ≤ ¥45-80 |
+| 会话末总结（Omni Flash） | 待核（≤ ¥0.01/次） | 2 次/天 | ≤ ¥0.6 |
 | **合计** | | | **预估 < ¥50/月** |
 
-DeepSeek 上下文缓存命中后输入成本再降 50%+；上表数字以 Anthropic 等价模型为上限参考，实际按 DeepSeek 当期价目重核。
+Qwen 上下文缓存命中后输入成本进一步降低；上表数字为粗估，实际按 DashScope 当期价目重核（Qwen Omni Flash/Plus 在国内通常显著低于上表估算）。
 
 ### 11.3 本地资源
 | 项 | 游戏 PC | 笔记本 |
@@ -654,7 +654,7 @@ paddleocr                  # OCR
 open_clip_torch            # 可选：CLIP 嵌入
 
 # 网络
-openai                     # DeepSeek API（OpenAI 兼容客户端）
+openai                     # Qwen / DashScope（OpenAI 兼容端点）
 httpx                      # HTTP client
 websockets                 # WS（TTS / VTS）
 
@@ -733,18 +733,18 @@ LivePartner/
 - [ ] 项目骨架（pyproject.toml + 配置加载 + 日志）
 - [ ] 采集卡视频 + 音频抓取（opencv + sounddevice）
 - [ ] Mumble bot：连接服务器、进入 LivePartner 频道、能 TX PCM
-- [ ] SSIM 触发 → DeepSeek V4 Pro vision → 文本输出
+- [ ] SSIM 触发 → Qwen Omni Plus vision → 文本输出
 - [ ] Edge TTS（先不部署 GPT-SoVITS）→ PCM → Mumble bot TX
 - [ ] 最简 PySide6 主窗（开关 + 实时日志）
 
 **验证**：玩 30 分钟游戏，主观打分每条 AI 发言的合理性。
 
 ### M2 智能化 + 记忆（2-3 周）
-- [ ] V4 Flash 预筛
+- [ ] Omni Flash 预筛
 - [ ] 沉默规则系统（cooldown + cutscene 检测）
 - [ ] HUD 模板匹配（先做 1 个游戏的死亡检测）
 - [ ] 记忆系统 observed.md 自动写入
-- [ ] 会话末 V4 Flash 总结
+- [ ] 会话末 Omni Flash 总结
 - [ ] 游戏 profile 切换
 
 **验证**：连玩 3 天，看记忆是否在第二天被合理引用。
@@ -782,7 +782,7 @@ LivePartner/
 
 | 风险 | 缓解方案 |
 |---|---|
-| DeepSeek V4 Pro vision 偶发延迟 > 3s | 5s timeout，超时跳过本轮 |
+| Qwen Omni Plus vision 偶发延迟 > 3s | 5s timeout，超时跳过本轮 |
 | GPT-SoVITS 进程崩溃 | systemd / NSSM `restart=always` |
 | **Mumble bot 掉线** | pymumble 内置重连；UI 显示连接状态 |
 | **采集卡驱动异常**（黑屏 / 无音） | 启动自检 + 设备重选 UI；记录最后健康设备 |
@@ -790,7 +790,7 @@ LivePartner/
 | **采集卡限制刷新率**（如 1080p120 → 1080p60） | SPEC 推荐型号验证过 120fps；用户选其他卡需自测 |
 | PTT 按下太短被截断 | Mumble bot 端 buffer 至少 500ms 完整音频再发 STT |
 | LLM 输出脏话 / 敏感词（直播） | 输出层敏感词过滤 + 人格 prompt 约束 |
-| 记忆文件无限增长 | 每 50 条 V4 Flash 压缩 + 老条目按月归档 |
+| 记忆文件无限增长 | 每 50 条 Omni Flash 压缩 + 老条目按月归档 |
 | Mumble 频道里同时有朋友 + AI bot，AI 该回谁 | bot 默认只响应"被点名"或"直接对话"；详见 §14.2 未决 |
 
 ### 14.2 未决（需要后续讨论）

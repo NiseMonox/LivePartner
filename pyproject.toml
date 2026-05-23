@@ -1,0 +1,51 @@
+[project]
+name = "livepartner"
+version = "0.1.0"
+description = "Desktop AI gaming companion — watches your screen, talks via Mumble"
+readme = "SPEC.md"
+requires-python = ">=3.11"
+authors = [{ name = "NiseMono" }]
+
+dependencies = [
+    "python-dotenv>=1.0",
+    "openai>=1.50",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+# M1+ runtime modules; install on demand as we implement each.
+capture = [
+    "opencv-python>=4.10",
+    "sounddevice>=0.5",
+    "pygrabber>=0.2",
+    "numpy>=1.26",
+]
+voice = [
+    "pymumble>=1.6",
+    "edge-tts>=6.1",
+]
+signals = [
+    "scikit-image>=0.24",
+]
+ui = [
+    "PySide6>=6.7",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/livepartner"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]  # line length handled by formatter
