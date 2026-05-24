@@ -49,18 +49,30 @@ class FrameSnapshot:
         return base64.b64encode(buf.tobytes()).decode("ascii")
 
     def thumbnail_png_b64(self, max_side: int = 256) -> str:
-        h, w = self.frame.shape[:2]
-        scale = min(1.0, max_side / max(h, w))
-        if scale < 1.0:
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-            small = cv2.resize(self.frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
-        else:
-            small = self.frame
+        small = self._scaled(max_side)
         ok, buf = cv2.imencode(".png", small)
         if not ok:
             raise RuntimeError("cv2.imencode PNG failed")
         return base64.b64encode(buf.tobytes()).decode("ascii")
+
+    def to_vlm_b64(self, max_side: int = 1024, quality: int = 80) -> tuple[str, str]:
+        """Compact JPEG suitable for vision LLM upload — ~50-150 KB typical at
+        max_side=1024 / q=80, vs ~500 KB-1 MB for 1080p PNG. Returns (b64, mime).
+        """
+        small = self._scaled(max_side)
+        ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+        if not ok:
+            raise RuntimeError("cv2.imencode JPEG failed")
+        return base64.b64encode(buf.tobytes()).decode("ascii"), "image/jpeg"
+
+    def _scaled(self, max_side: int) -> np.ndarray:
+        h, w = self.frame.shape[:2]
+        scale = min(1.0, max_side / max(h, w))
+        if scale >= 1.0:
+            return self.frame
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        return cv2.resize(self.frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
 
 class CaptureSource:

@@ -202,12 +202,16 @@ class DecisionWorker(QThread):
 
     def run(self) -> None:
         try:
+            frame_mime = "image/png"
             if self.req.captured_frame is not None:
                 snap = self.req.captured_frame
                 h, w = snap.frame.shape[:2]
-                frame_b64 = snap.to_png_b64()
+                frame_b64, frame_mime = snap.to_vlm_b64(max_side=1024, quality=80)
                 thumb_b64 = snap.thumbnail_png_b64(max_side=256)
-                self.log.emit(f"frame from capture {w}x{h}  age={time.monotonic()-snap.timestamp:.2f}s")
+                self.log.emit(
+                    f"frame from capture {w}x{h} → {len(frame_b64)*3//4//1024} KB jpeg  "
+                    f"age={time.monotonic()-snap.timestamp:.2f}s"
+                )
             elif self.req.synthesize_frame:
                 img = _synth_you_died_frame()
                 frame_b64 = _pil_to_b64(img)
@@ -242,6 +246,7 @@ class DecisionWorker(QThread):
             t0 = time.perf_counter()
             reply = generate(
                 self.req.event, frame_b64, self.req.persona,
+                mime=frame_mime,
                 bilingual=(self.req.tts_language != self.req.subtitle_language),
                 tts_language=self.req.tts_language,
                 subtitle_language=self.req.subtitle_language,
@@ -283,7 +288,11 @@ class DecisionWorker(QThread):
                           f"{len(pcm)//1024} KB  {dur:.2f}s")
             self.req.bot.send_pcm(pcm)
             self.log.emit(f"[mumble] streaming {dur:.2f}s into "
-                          f"{self.req.bot.current_channel_name!r}")
+                          f"{self.req.bot.current_channel_name!r}, "
+                          f"waiting for buffer to drain…")
+            # Block until Mumble has actually finished sending — so the worker
+            # accurately represents "AI still speaking".
+            self.req.bot.wait_until_silent(max_wait=max(dur + 3.0, 5.0))
 
     def _tts_qwen3_streaming(self, text: str) -> None:
         cfg = Qwen3TtsConfig(base_url=self.req.qwen3_url, language=self.req.tts_language)
@@ -303,8 +312,14 @@ class DecisionWorker(QThread):
                 self.req.bot.send_pcm(chunk)
         dt = (time.perf_counter() - t0) * 1000
         dur_s = total / (48000 * 2)
-        self.log.emit(f"[qwen3] done {dt:.0f} ms  {total//1024} KB PCM  {dur_s:.2f}s "
+        self.log.emit(f"[qwen3] gen+queue {dt:.0f} ms  {total//1024} KB PCM  {dur_s:.2f}s "
                       f"(RTF {dur_s / (dt/1000):.2f})")
+        # Wait for the Mumble TX queue to actually drain — otherwise the worker
+        # "finishes" while audio is still playing, and a new utterance racing
+        # in would think the AI is free.
+        if self.req.bot is not None:
+            self.req.bot.wait_until_silent(max_wait=max(dur_s + 3.0, 5.0))
+            self.log.emit("[mumble] TX queue drained")
 
 
 # ---------- main window ----------
@@ -331,6 +346,11 @@ class MainWindow(QMainWindow):
         self.stt_load_worker: STTLoadWorker | None = None
         self.stt_workers: list[STTTranscribeWorker] = []
         self.capture: CaptureSource | None = None
+        # If a new utterance arrives while DecisionWorker is busy, we stash the
+        # latest one here (replacing any older pending), and pick it up the
+        # instant the current pipeline finishes. Per-utterance not per-stream:
+        # this is the raw PCM, STT happens only when we're ready to act on it.
+        self.pending_utterance: tuple[dict, bytes] | None = None
 
         tabs = QTabWidget()
         tabs.addTab(self._build_run_tab(), "运行")
@@ -688,6 +708,21 @@ class MainWindow(QMainWindow):
         if not self.stt_listen_check.isChecked():
             self._log(f"[mumble] heard {name!r} ({dur:.2f}s) — listen toggle off, ignoring")
             return
+
+        # If AI is still mid-pipeline (gen+TTS+Mumble drain), stash this for after.
+        if self.decision_worker is not None and self.decision_worker.isRunning():
+            replaced = self.pending_utterance is not None
+            self.pending_utterance = (user, pcm_bytes)
+            tag = "替换待处理" if replaced else "排队"
+            self._log(f"[stt] AI 在忙, {tag}: {name!r} ({dur:.2f}s) — 说完后处理")
+            self.statusBar().showMessage(f"AI 在说话, 说完后会处理 {name!r} 这句")
+            return
+
+        self._dispatch_transcribe(user, pcm_bytes)
+
+    def _dispatch_transcribe(self, user: dict, pcm_bytes: bytes) -> None:
+        name = user.get("name", "?")
+        dur = len(pcm_bytes) / (48000 * 2)
         self._log(f"[stt] {name!r} spoke {dur:.2f}s, transcribing…")
         w = STTTranscribeWorker(self.stt, user, pcm_bytes)
         w.log.connect(self._log)
@@ -942,6 +977,15 @@ class MainWindow(QMainWindow):
     def _cleanup_decision(self) -> None:
         self.trigger_btn.setEnabled(True)
         self.decision_worker = None
+        # If something was queued while we were busy, process it now.
+        pending = self.pending_utterance
+        self.pending_utterance = None
+        if pending is not None:
+            user, pcm = pending
+            name = user.get("name", "?")
+            self._log(f"[stt] 处理排队的 {name!r}")
+            self.statusBar().showMessage(f"处理排队的 {name!r}")
+            self._dispatch_transcribe(user, pcm)
 
     # ---------- shutdown ----------
     def closeEvent(self, ev) -> None:
