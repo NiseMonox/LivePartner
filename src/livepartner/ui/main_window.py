@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..audio_codec import mp3_to_pcm48k, pcm48k_duration_seconds
+from ..capture import CaptureSource, FrameSnapshot, list_video_devices
 from ..decision import gate, generate
 from ..mumble_bot import MumbleBot, MumbleConfig
 from ..persona import Persona, list_personas, load_persona
@@ -161,14 +162,15 @@ class DecisionRequest:
     persona: Persona
     event: str
     force_speak: bool
-    save_mp3: bool          # save Edge TTS mp3 to demo_tts.mp3
-    bot: MumbleBot | None   # if set, also stream PCM through it
-    engine: str             # "edge" or "qwen3"
-    qwen3_url: str          # base url for qwen3 server when engine=qwen3
-    tts_language: str       # voice language, e.g. "日语" / "中文" / "英语"
-    subtitle_language: str  # display language, e.g. "中文"
-    synthesize_frame: bool = True   # game-event trigger: feed a YOU DIED frame; voice chat: no frame
-    is_conversation: bool = False   # voice chat — tells the LLM to drop "stay silent" rules
+    save_mp3: bool                   # save Edge TTS mp3 to demo_tts.mp3
+    bot: MumbleBot | None            # if set, also stream PCM through it
+    engine: str                      # "edge" or "qwen3"
+    qwen3_url: str                   # base url for qwen3 server when engine=qwen3
+    tts_language: str                # voice language, e.g. "日语" / "中文" / "英语"
+    subtitle_language: str           # display language, e.g. "中文"
+    synthesize_frame: bool = True    # fallback synthesize YOU DIED if no live frame available
+    is_conversation: bool = False    # voice chat — tells the LLM to drop "stay silent" rules
+    captured_frame: FrameSnapshot | None = None  # live frame from capture card, if any
 
 
 class DecisionWorker(QThread):
@@ -182,13 +184,19 @@ class DecisionWorker(QThread):
 
     def run(self) -> None:
         try:
-            if self.req.synthesize_frame:
+            if self.req.captured_frame is not None:
+                snap = self.req.captured_frame
+                h, w = snap.frame.shape[:2]
+                frame_b64 = snap.to_png_b64()
+                thumb_b64 = snap.thumbnail_png_b64(max_side=256)
+                self.log.emit(f"frame from capture {w}x{h}  age={time.monotonic()-snap.timestamp:.2f}s")
+            elif self.req.synthesize_frame:
                 img = _synth_you_died_frame()
                 frame_b64 = _pil_to_b64(img)
                 thumb = img.copy()
                 thumb.thumbnail((256, 256))
                 thumb_b64 = _pil_to_b64(thumb)
-                self.log.emit(f"frame {img.size[0]}x{img.size[1]}, thumb {thumb.size[0]}x{thumb.size[1]}")
+                self.log.emit(f"frame synthesized {img.size[0]}x{img.size[1]} (no capture)")
             else:
                 frame_b64 = None
                 thumb_b64 = None
@@ -384,6 +392,31 @@ class MainWindow(QMainWindow):
 
         root.addWidget(tts_box)
 
+        # --- Capture panel ---
+        cap_box = QGroupBox("采集卡 (HDMI 视频)")
+        cap_layout = QHBoxLayout(cap_box)
+        cap_layout.addWidget(QLabel("设备:"))
+        self.cap_device_combo = QComboBox()
+        for i, name in enumerate(list_video_devices()):
+            self.cap_device_combo.addItem(f"[{i}] {name}", userData=i)
+        cap_layout.addWidget(self.cap_device_combo, stretch=1)
+        cap_layout.addWidget(QLabel("分辨率:"))
+        self.cap_res_combo = QComboBox()
+        for w, h in [(1280, 720), (1920, 1080), (640, 360)]:
+            self.cap_res_combo.addItem(f"{w}x{h}", userData=(w, h))
+        cap_layout.addWidget(self.cap_res_combo)
+        self.cap_start_btn = QPushButton("启动")
+        self.cap_start_btn.clicked.connect(self._on_capture_start)
+        cap_layout.addWidget(self.cap_start_btn)
+        self.cap_stop_btn = QPushButton("停止")
+        self.cap_stop_btn.clicked.connect(self._on_capture_stop)
+        self.cap_stop_btn.setEnabled(False)
+        cap_layout.addWidget(self.cap_stop_btn)
+        self.cap_status = QLabel("(未启动)")
+        self.cap_status.setStyleSheet("color: #888;")
+        cap_layout.addWidget(self.cap_status, stretch=1)
+        root.addWidget(cap_box)
+
         # --- Mumble panel ---
         mumble_box = QGroupBox("Mumble")
         mumble_layout = QVBoxLayout(mumble_box)
@@ -499,6 +532,7 @@ class MainWindow(QMainWindow):
         self.stt = None  # populated by STTLoadWorker
         self.stt_load_worker: STTLoadWorker | None = None
         self.stt_workers: list[STTTranscribeWorker] = []
+        self.capture: CaptureSource | None = None
 
         # Bridge: bot callback (network thread) → Qt signal → UI-thread slot
         self.utterance_signal.connect(self._on_utterance_arrived)
@@ -691,6 +725,41 @@ class MainWindow(QMainWindow):
         if self.stt is None:
             self.stt_load_btn.setEnabled(True)
 
+    # ---------- capture ----------
+    def _on_capture_start(self) -> None:
+        if self.capture is not None and self.capture.is_running:
+            return
+        dev = self.cap_device_combo.currentData()
+        if dev is None:
+            QMessageBox.warning(self, "提示", "没有可用视频设备")
+            return
+        w, h = self.cap_res_combo.currentData() or (1280, 720)
+        try:
+            cap = CaptureSource(device_index=int(dev), width=w, height=h, fps=30)
+            cap.start()
+        except Exception as e:
+            self.cap_status.setText(f"启动失败")
+            self.cap_status.setStyleSheet("color: #c33;")
+            self._log(f"[capture] {type(e).__name__}: {e}")
+            return
+        self.capture = cap
+        size = cap.negotiated_size or (w, h)
+        self.cap_status.setText(f"运行中 · {size[0]}x{size[1]}")
+        self.cap_status.setStyleSheet("color: #2a2;")
+        self.cap_start_btn.setEnabled(False)
+        self.cap_stop_btn.setEnabled(True)
+        self._log(f"[capture] started  device={dev}  {size[0]}x{size[1]}")
+
+    def _on_capture_stop(self) -> None:
+        if self.capture is not None:
+            self.capture.stop()
+            self.capture = None
+        self.cap_status.setText("(未启动)")
+        self.cap_status.setStyleSheet("color: #888;")
+        self.cap_start_btn.setEnabled(True)
+        self.cap_stop_btn.setEnabled(False)
+        self._log("[capture] stopped")
+
     def _on_mumble_connected(self, bot: object) -> None:
         assert isinstance(bot, MumbleBot)
         self.bot = bot
@@ -750,6 +819,12 @@ class MainWindow(QMainWindow):
         tts_lang = self.tts_lang_combo.currentData() or "日语"
         sub_lang = self.sub_lang_combo.currentData() or "中文"
 
+        captured = None
+        if self.capture is not None and self.capture.is_running:
+            captured = self.capture.latest_frame(max_age_sec=1.5)
+            if captured is None:
+                self._log("[capture] 启动但没有最近帧, 回落到合成帧")
+
         self._log(f"\n=== {persona.display_name} ({persona_id}) ===")
         self._log(f"事件: {self.event_edit.text()}")
         self._log(f"TTS 引擎: {engine}{' @ ' + qwen3_url if engine == 'qwen3' else ''}  "
@@ -769,6 +844,7 @@ class MainWindow(QMainWindow):
             qwen3_url=qwen3_url,
             tts_language=tts_lang,
             subtitle_language=sub_lang,
+            captured_frame=captured,
         ))
         self.decision_worker.log.connect(self._log)
         self.decision_worker.finished_ok.connect(self._on_decision_done)
@@ -793,6 +869,11 @@ class MainWindow(QMainWindow):
 
     # ---------- shutdown ----------
     def closeEvent(self, ev) -> None:
+        if self.capture is not None:
+            try:
+                self.capture.stop()
+            except Exception:
+                pass
         if self.bot is not None:
             try:
                 self.bot.stop()
