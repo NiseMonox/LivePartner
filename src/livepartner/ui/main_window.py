@@ -114,6 +114,8 @@ class DecisionRequest:
     bot: MumbleBot | None   # if set, also stream PCM through it
     engine: str             # "edge" or "qwen3"
     qwen3_url: str          # base url for qwen3 server when engine=qwen3
+    tts_language: str       # voice language, e.g. "日语" / "中文" / "英语"
+    subtitle_language: str  # display language, e.g. "中文"
 
 
 class DecisionWorker(QThread):
@@ -150,21 +152,29 @@ class DecisionWorker(QThread):
                 return
 
             t0 = time.perf_counter()
-            reply = generate(self.req.event, frame_b64, self.req.persona)
+            reply = generate(
+                self.req.event, frame_b64, self.req.persona,
+                bilingual=(self.req.tts_language != self.req.subtitle_language),
+                tts_language=self.req.tts_language,
+                subtitle_language=self.req.subtitle_language,
+            )
             dt_gen = (time.perf_counter() - t0) * 1000
             self.log.emit(f"[generate] {dt_gen:.0f} ms")
-            self.log.emit(f"AI ({self.req.persona.display_name}) > {reply.text}")
+            self.log.emit(f"AI 字幕({self.req.subtitle_language}): {reply.text}")
+            if reply.tts_text != reply.text:
+                self.log.emit(f"AI 配音({self.req.tts_language}): {reply.tts_text}")
             self.log.emit(f"total LLM: {dt_gate + dt_gen:.0f} ms")
 
-            if not reply.text:
+            if not reply.tts_text:
                 self.finished_ok.emit("")
                 return
 
             if self.req.engine == "qwen3":
-                self._tts_qwen3_streaming(reply.text)
+                self._tts_qwen3_streaming(reply.tts_text)
             else:
-                self._tts_edge(reply.text)
+                self._tts_edge(reply.tts_text)
 
+            # UI displays the subtitle (Chinese), so emit reply.text not tts_text.
             self.finished_ok.emit(reply.text)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -188,7 +198,7 @@ class DecisionWorker(QThread):
                           f"{self.req.bot.current_channel_name!r}")
 
     def _tts_qwen3_streaming(self, text: str) -> None:
-        cfg = Qwen3TtsConfig(base_url=self.req.qwen3_url)
+        cfg = Qwen3TtsConfig(base_url=self.req.qwen3_url, language=self.req.tts_language)
         t0 = time.perf_counter()
         total = 0
         first_ms = None
@@ -260,23 +270,45 @@ class MainWindow(QMainWindow):
 
         # --- TTS panel ---
         tts_box = QGroupBox("TTS 引擎")
-        tts_layout = QHBoxLayout(tts_box)
-        tts_layout.addWidget(QLabel("引擎:"))
+        tts_outer = QVBoxLayout(tts_box)
+
+        tts_row1 = QHBoxLayout()
+        tts_row1.addWidget(QLabel("引擎:"))
         self.tts_engine_combo = QComboBox()
         self.tts_engine_combo.addItem("Edge TTS (云,免费)", userData="edge")
         self.tts_engine_combo.addItem("Qwen3-TTS (本地,克隆)", userData="qwen3")
+        self.tts_engine_combo.setCurrentIndex(1)  # default to Qwen3 now that voices are trained
         self.tts_engine_combo.currentIndexChanged.connect(self._on_engine_changed)
-        tts_layout.addWidget(self.tts_engine_combo)
-        tts_layout.addWidget(QLabel("Qwen3 URL:"))
+        tts_row1.addWidget(self.tts_engine_combo)
+
+        tts_row1.addWidget(QLabel("配音语种:"))
+        self.tts_lang_combo = QComboBox()
+        for label, code in [("日语", "日语"), ("中文", "中文"), ("英语", "英语"),
+                            ("韩语", "韩语"), ("法语", "法语")]:
+            self.tts_lang_combo.addItem(label, userData=code)
+        tts_row1.addWidget(self.tts_lang_combo)
+
+        tts_row1.addWidget(QLabel("字幕语种:"))
+        self.sub_lang_combo = QComboBox()
+        for label, code in [("中文", "中文"), ("日语", "日语"), ("英语", "英语")]:
+            self.sub_lang_combo.addItem(label, userData=code)
+        tts_row1.addWidget(self.sub_lang_combo)
+        tts_row1.addStretch()
+        tts_outer.addLayout(tts_row1)
+
+        tts_row2 = QHBoxLayout()
+        tts_row2.addWidget(QLabel("Qwen3 URL:"))
         self.qwen3_url_edit = QLineEdit(QWEN3_DEFAULT_URL)
         self.qwen3_url_edit.setMaximumWidth(240)
-        tts_layout.addWidget(self.qwen3_url_edit)
+        tts_row2.addWidget(self.qwen3_url_edit)
         self.qwen3_probe_btn = QPushButton("检测")
         self.qwen3_probe_btn.clicked.connect(self._on_probe_qwen3)
-        tts_layout.addWidget(self.qwen3_probe_btn)
+        tts_row2.addWidget(self.qwen3_probe_btn)
         self.qwen3_status = QLabel("(未检测)")
         self.qwen3_status.setStyleSheet("color: #888;")
-        tts_layout.addWidget(self.qwen3_status, stretch=1)
+        tts_row2.addWidget(self.qwen3_status, stretch=1)
+        tts_outer.addLayout(tts_row2)
+
         root.addWidget(tts_box)
 
         # --- Mumble panel ---
@@ -462,10 +494,13 @@ class MainWindow(QMainWindow):
 
         engine = self.tts_engine_combo.currentData() or "edge"
         qwen3_url = self.qwen3_url_edit.text().strip().rstrip("/")
+        tts_lang = self.tts_lang_combo.currentData() or "日语"
+        sub_lang = self.sub_lang_combo.currentData() or "中文"
 
         self._log(f"\n=== {persona.display_name} ({persona_id}) ===")
         self._log(f"事件: {self.event_edit.text()}")
-        self._log(f"TTS 引擎: {engine}{' @ ' + qwen3_url if engine == 'qwen3' else ''}")
+        self._log(f"TTS 引擎: {engine}{' @ ' + qwen3_url if engine == 'qwen3' else ''}  "
+                  f"配音={tts_lang}  字幕={sub_lang}")
         if bot_for_speech is not None:
             self._log(f"(通过 Mumble 频道 {bot_for_speech.current_channel_name!r} 播放)")
         self.trigger_btn.setEnabled(False)
@@ -479,6 +514,8 @@ class MainWindow(QMainWindow):
             bot=bot_for_speech,
             engine=engine,
             qwen3_url=qwen3_url,
+            tts_language=tts_lang,
+            subtitle_language=sub_lang,
         ))
         self.decision_worker.log.connect(self._log)
         self.decision_worker.finished_ok.connect(self._on_decision_done)
