@@ -25,7 +25,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=64738)
-    ap.add_argument("--name", default="LivePartner")
+    ap.add_argument("--name", default="Eri")
     ap.add_argument("--channel", default="LivePartner")
     ap.add_argument("--password", default="")
     ap.add_argument("--persona", default="snark")

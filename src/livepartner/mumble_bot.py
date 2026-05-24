@@ -69,7 +69,7 @@ log = logging.getLogger(__name__)
 class MumbleConfig:
     host: str = "127.0.0.1"
     port: int = 64738
-    name: str = "LivePartner"
+    name: str = "Eri"
     password: str = ""
     channel: str = "LivePartner"
     reconnect: bool = True

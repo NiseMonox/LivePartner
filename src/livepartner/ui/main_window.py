@@ -385,7 +385,7 @@ class MainWindow(QMainWindow):
         self.mumble_port.setValue(64738)
         mrow1.addWidget(self.mumble_port)
         mrow1.addWidget(QLabel("name:"))
-        self.mumble_name = QLineEdit("LivePartner")
+        self.mumble_name = QLineEdit("Eri")
         self.mumble_name.setMaximumWidth(160)
         mrow1.addWidget(self.mumble_name)
         mrow1.addWidget(QLabel("channel:"))
@@ -534,7 +534,7 @@ class MainWindow(QMainWindow):
         cfg = MumbleConfig(
             host=self.mumble_host.text().strip(),
             port=self.mumble_port.value(),
-            name=self.mumble_name.text().strip() or "LivePartner",
+            name=self.mumble_name.text().strip() or "Eri",
             channel=self.mumble_channel.text().strip() or "LivePartner",
         )
         self.mumble_connect_btn.setEnabled(False)
