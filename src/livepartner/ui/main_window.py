@@ -3,6 +3,7 @@
 Provides:
   - persona dropdown
   - editable event description (manual trigger source)
+  - TTS engine selection: Edge TTS (cloud) or Qwen3 (local server)
   - Mumble connect/disconnect with status, so the bot stays present in a channel
     and AI lines play live through Mumble while connected
   - "Trigger" button → runs gate→generate→TTS on a synthesized YOU DIED frame
@@ -40,6 +41,13 @@ from ..decision import gate, generate
 from ..mumble_bot import MumbleBot, MumbleConfig
 from ..persona import Persona, list_personas, load_persona
 from ..tts import synthesize_for_persona
+from ..tts_qwen3 import (
+    DEFAULT_BASE_URL as QWEN3_DEFAULT_URL,
+    Qwen3TtsConfig,
+    is_alive as qwen3_is_alive,
+    list_voices as qwen3_list_voices,
+    stream_pcm as qwen3_stream_pcm,
+)
 
 
 def _synth_you_died_frame(size: tuple[int, int] = (1280, 720)) -> Image.Image:
@@ -78,7 +86,7 @@ def _pil_to_b64(img: Image.Image) -> str:
 
 class MumbleConnectWorker(QThread):
     log = Signal(str)
-    connected = Signal(object)  # MumbleBot
+    connected = Signal(object)
     failed = Signal(str)
 
     def __init__(self, cfg: MumbleConfig):
@@ -102,8 +110,10 @@ class DecisionRequest:
     persona: Persona
     event: str
     force_speak: bool
-    do_tts: bool
-    bot: MumbleBot | None  # if set, also stream PCM through it
+    save_mp3: bool          # save Edge TTS mp3 to demo_tts.mp3
+    bot: MumbleBot | None   # if set, also stream PCM through it
+    engine: str             # "edge" or "qwen3"
+    qwen3_url: str          # base url for qwen3 server when engine=qwen3
 
 
 class DecisionWorker(QThread):
@@ -146,28 +156,71 @@ class DecisionWorker(QThread):
             self.log.emit(f"AI ({self.req.persona.display_name}) > {reply.text}")
             self.log.emit(f"total LLM: {dt_gate + dt_gen:.0f} ms")
 
-            if (self.req.do_tts or self.req.bot is not None) and reply.text:
-                t0 = time.perf_counter()
-                tts = synthesize_for_persona(reply.text, self.req.persona)
-                dt_tts = (time.perf_counter() - t0) * 1000
-                self.log.emit(f"[tts] {dt_tts:.0f} ms  voice={tts.voice_id}  "
-                              f"{len(tts.mp3)//1024} KB mp3")
-                if self.req.do_tts:
-                    Path("demo_tts.mp3").write_bytes(tts.mp3)
+            if not reply.text:
+                self.finished_ok.emit("")
+                return
 
-                if self.req.bot is not None:
-                    t0 = time.perf_counter()
-                    pcm = mp3_to_pcm48k(tts.mp3)
-                    dur = pcm48k_duration_seconds(pcm)
-                    self.log.emit(f"[pcm] {(time.perf_counter()-t0)*1000:.0f} ms  "
-                                  f"{len(pcm)//1024} KB  {dur:.2f}s")
-                    self.req.bot.send_pcm(pcm)
-                    self.log.emit(f"[mumble] streaming {dur:.2f}s into channel "
-                                  f"{self.req.bot.current_channel_name!r} …")
+            if self.req.engine == "qwen3":
+                self._tts_qwen3_streaming(reply.text)
+            else:
+                self._tts_edge(reply.text)
 
             self.finished_ok.emit(reply.text)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
+
+    def _tts_edge(self, text: str) -> None:
+        t0 = time.perf_counter()
+        tts = synthesize_for_persona(text, self.req.persona)
+        dt_tts = (time.perf_counter() - t0) * 1000
+        self.log.emit(f"[edge-tts] {dt_tts:.0f} ms  voice={tts.voice_id}  "
+                      f"{len(tts.mp3)//1024} KB mp3")
+        if self.req.save_mp3:
+            Path("demo_tts.mp3").write_bytes(tts.mp3)
+        if self.req.bot is not None:
+            t0 = time.perf_counter()
+            pcm = mp3_to_pcm48k(tts.mp3)
+            dur = pcm48k_duration_seconds(pcm)
+            self.log.emit(f"[pcm decode] {(time.perf_counter()-t0)*1000:.0f} ms  "
+                          f"{len(pcm)//1024} KB  {dur:.2f}s")
+            self.req.bot.send_pcm(pcm)
+            self.log.emit(f"[mumble] streaming {dur:.2f}s into "
+                          f"{self.req.bot.current_channel_name!r}")
+
+    def _tts_qwen3_streaming(self, text: str) -> None:
+        cfg = Qwen3TtsConfig(base_url=self.req.qwen3_url)
+        t0 = time.perf_counter()
+        total = 0
+        first_ms = None
+        for chunk in qwen3_stream_pcm(text, self.req.persona, cfg=cfg):
+            if first_ms is None:
+                first_ms = (time.perf_counter() - t0) * 1000
+                target = "Mumble" if self.req.bot else "(dropped, no Mumble)"
+                self.log.emit(f"[qwen3] TTFB {first_ms:.0f} ms → streaming to {target}")
+            total += len(chunk)
+            if self.req.bot is not None:
+                self.req.bot.send_pcm(chunk)
+        dt = (time.perf_counter() - t0) * 1000
+        dur_s = total / (48000 * 2)
+        self.log.emit(f"[qwen3] done {dt:.0f} ms  {total//1024} KB PCM  {dur_s:.2f}s "
+                      f"(RTF {dur_s / (dt/1000):.2f})")
+
+
+class Qwen3ProbeWorker(QThread):
+    """Quick async check of qwen3 server: alive + voice list."""
+    done = Signal(bool, list, str)  # alive, voices, error_or_url
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+
+    def run(self) -> None:
+        try:
+            alive = qwen3_is_alive(self.url, timeout=1.5)
+            voices = qwen3_list_voices(self.url) if alive else []
+            self.done.emit(alive, voices, self.url)
+        except Exception as e:
+            self.done.emit(False, [], f"{type(e).__name__}: {e}")
 
 
 # ---------- main window ----------
@@ -181,7 +234,7 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("LivePartner (M1)")
-        self.resize(880, 640)
+        self.resize(960, 740)
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -200,10 +253,31 @@ class MainWindow(QMainWindow):
         self.force_check = QCheckBox("force_speak (跳过 gate)")
         self.force_check.setChecked(True)
         row1.addWidget(self.force_check)
-        self.tts_save_check = QCheckBox("保存 demo_tts.mp3")
-        self.tts_save_check.setChecked(True)
-        row1.addWidget(self.tts_save_check)
+        self.save_mp3_check = QCheckBox("保存 demo_tts.mp3 (Edge)")
+        self.save_mp3_check.setChecked(False)
+        row1.addWidget(self.save_mp3_check)
         root.addLayout(row1)
+
+        # --- TTS panel ---
+        tts_box = QGroupBox("TTS 引擎")
+        tts_layout = QHBoxLayout(tts_box)
+        tts_layout.addWidget(QLabel("引擎:"))
+        self.tts_engine_combo = QComboBox()
+        self.tts_engine_combo.addItem("Edge TTS (云,免费)", userData="edge")
+        self.tts_engine_combo.addItem("Qwen3-TTS (本地,克隆)", userData="qwen3")
+        self.tts_engine_combo.currentIndexChanged.connect(self._on_engine_changed)
+        tts_layout.addWidget(self.tts_engine_combo)
+        tts_layout.addWidget(QLabel("Qwen3 URL:"))
+        self.qwen3_url_edit = QLineEdit(QWEN3_DEFAULT_URL)
+        self.qwen3_url_edit.setMaximumWidth(240)
+        tts_layout.addWidget(self.qwen3_url_edit)
+        self.qwen3_probe_btn = QPushButton("检测")
+        self.qwen3_probe_btn.clicked.connect(self._on_probe_qwen3)
+        tts_layout.addWidget(self.qwen3_probe_btn)
+        self.qwen3_status = QLabel("(未检测)")
+        self.qwen3_status.setStyleSheet("color: #888;")
+        tts_layout.addWidget(self.qwen3_status, stretch=1)
+        root.addWidget(tts_box)
 
         # --- Mumble panel ---
         mumble_box = QGroupBox("Mumble")
@@ -275,11 +349,42 @@ class MainWindow(QMainWindow):
 
         self.decision_worker: DecisionWorker | None = None
         self.connect_worker: MumbleConnectWorker | None = None
+        self.probe_worker: Qwen3ProbeWorker | None = None
         self.bot: MumbleBot | None = None
+
+        self._on_engine_changed()  # set initial state of qwen3 controls
 
     # ---------- logging ----------
     def _log(self, msg: str) -> None:
         self.log_view.append(msg)
+
+    # ---------- TTS engine ----------
+    def _on_engine_changed(self) -> None:
+        is_qwen3 = self.tts_engine_combo.currentData() == "qwen3"
+        self.qwen3_url_edit.setEnabled(is_qwen3)
+        self.qwen3_probe_btn.setEnabled(is_qwen3)
+
+    def _on_probe_qwen3(self) -> None:
+        if self.probe_worker is not None and self.probe_worker.isRunning():
+            return
+        url = self.qwen3_url_edit.text().strip().rstrip("/")
+        self.qwen3_status.setText("检测中…")
+        self.qwen3_status.setStyleSheet("color: #c80;")
+        self.probe_worker = Qwen3ProbeWorker(url)
+        self.probe_worker.done.connect(self._on_probe_done)
+        self.probe_worker.finished.connect(self._cleanup_probe)
+        self.probe_worker.start()
+
+    def _on_probe_done(self, alive: bool, voices: list, info: str) -> None:
+        if alive:
+            self.qwen3_status.setText(f"在线 · voices: {', '.join(voices) or '(空)'}")
+            self.qwen3_status.setStyleSheet("color: #2a2;")
+        else:
+            self.qwen3_status.setText(f"不可达 ({info})")
+            self.qwen3_status.setStyleSheet("color: #c33;")
+
+    def _cleanup_probe(self) -> None:
+        self.probe_worker = None
 
     # ---------- Mumble ----------
     def _on_connect_mumble(self) -> None:
@@ -315,7 +420,7 @@ class MainWindow(QMainWindow):
 
     def _on_mumble_failed(self, msg: str) -> None:
         self._log(f"[mumble] connect FAILED: {msg}")
-        self.mumble_status.setText(f"连接失败")
+        self.mumble_status.setText("连接失败")
         self.mumble_status.setStyleSheet("color: #c33;")
         self.mumble_connect_btn.setEnabled(True)
 
@@ -355,10 +460,14 @@ class MainWindow(QMainWindow):
 
         bot_for_speech = self.bot if (self.bot is not None and self.mumble_speak_check.isChecked()) else None
 
+        engine = self.tts_engine_combo.currentData() or "edge"
+        qwen3_url = self.qwen3_url_edit.text().strip().rstrip("/")
+
         self._log(f"\n=== {persona.display_name} ({persona_id}) ===")
         self._log(f"事件: {self.event_edit.text()}")
+        self._log(f"TTS 引擎: {engine}{' @ ' + qwen3_url if engine == 'qwen3' else ''}")
         if bot_for_speech is not None:
-            self._log(f"(将通过 Mumble 频道 {bot_for_speech.current_channel_name!r} 播放)")
+            self._log(f"(通过 Mumble 频道 {bot_for_speech.current_channel_name!r} 播放)")
         self.trigger_btn.setEnabled(False)
         self.statusBar().showMessage("运行中…")
 
@@ -366,8 +475,10 @@ class MainWindow(QMainWindow):
             persona=persona,
             event=self.event_edit.text(),
             force_speak=self.force_check.isChecked(),
-            do_tts=self.tts_save_check.isChecked(),
+            save_mp3=self.save_mp3_check.isChecked(),
             bot=bot_for_speech,
+            engine=engine,
+            qwen3_url=qwen3_url,
         ))
         self.decision_worker.log.connect(self._log)
         self.decision_worker.finished_ok.connect(self._on_decision_done)
