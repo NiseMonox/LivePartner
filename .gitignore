@@ -49,8 +49,9 @@ test_*.mp3
 *.tmp
 .git_commit_msg.tmp
 
-# Per-user voice embeddings — extract locally from your own reference audio
+# Per-user voice embeddings + reference audio — local only
 personas/voices/
+Voice_Source/
 
 # Mumble dev server data
 mumble-server.sqlite
