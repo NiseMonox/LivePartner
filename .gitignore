@@ -44,8 +44,13 @@ logs/
 demo_*.mp3
 demo_*.wav
 demo_*.png
+test_*.wav
+test_*.mp3
 *.tmp
 .git_commit_msg.tmp
+
+# Per-user voice embeddings — extract locally from your own reference audio
+personas/voices/
 
 # Mumble dev server data
 mumble-server.sqlite
