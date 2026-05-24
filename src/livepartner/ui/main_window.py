@@ -167,6 +167,8 @@ class DecisionRequest:
     qwen3_url: str          # base url for qwen3 server when engine=qwen3
     tts_language: str       # voice language, e.g. "日语" / "中文" / "英语"
     subtitle_language: str  # display language, e.g. "中文"
+    synthesize_frame: bool = True   # game-event trigger: feed a YOU DIED frame; voice chat: no frame
+    is_conversation: bool = False   # voice chat — tells the LLM to drop "stay silent" rules
 
 
 class DecisionWorker(QThread):
@@ -180,22 +182,32 @@ class DecisionWorker(QThread):
 
     def run(self) -> None:
         try:
-            img = _synth_you_died_frame()
-            frame_b64 = _pil_to_b64(img)
-            thumb = img.copy()
-            thumb.thumbnail((256, 256))
-            thumb_b64 = _pil_to_b64(thumb)
-            self.log.emit(f"frame {img.size[0]}x{img.size[1]}, thumb {thumb.size[0]}x{thumb.size[1]}")
+            if self.req.synthesize_frame:
+                img = _synth_you_died_frame()
+                frame_b64 = _pil_to_b64(img)
+                thumb = img.copy()
+                thumb.thumbnail((256, 256))
+                thumb_b64 = _pil_to_b64(thumb)
+                self.log.emit(f"frame {img.size[0]}x{img.size[1]}, thumb {thumb.size[0]}x{thumb.size[1]}")
+            else:
+                frame_b64 = None
+                thumb_b64 = None
+                self.log.emit("conversation mode — no game frame")
 
             if self.req.force_speak:
                 self.log.emit("[gate] skipped (force_speak)")
                 speak = True
                 dt_gate = 0.0
-            else:
+            elif thumb_b64 is not None:
                 t0 = time.perf_counter()
                 speak = gate(self.req.event, thumb_b64, self.req.persona)
                 dt_gate = (time.perf_counter() - t0) * 1000
                 self.log.emit(f"[gate] speak={speak}  ({dt_gate:.0f} ms)")
+            else:
+                # No frame, no force — refuse to invent intent for the AI.
+                self.log.emit("[gate] no frame + not forced → silent")
+                self.finished_ok.emit("")
+                return
 
             if not speak:
                 self.log.emit("AI 选择沉默。")
@@ -208,6 +220,7 @@ class DecisionWorker(QThread):
                 bilingual=(self.req.tts_language != self.req.subtitle_language),
                 tts_language=self.req.tts_language,
                 subtitle_language=self.req.subtitle_language,
+                is_conversation=self.req.is_conversation,
             )
             dt_gen = (time.perf_counter() - t0) * 1000
             self.log.emit(f"[generate] {dt_gen:.0f} ms")
@@ -622,8 +635,8 @@ class MainWindow(QMainWindow):
         qwen3_url = self.qwen3_url_edit.text().strip().rstrip("/")
         tts_lang = self.tts_lang_combo.currentData() or "Japanese"
         sub_lang = self.sub_lang_combo.currentData() or "Chinese"
-        event = f"{name} 说话: {text}"
-        self._log(f"=== {persona.display_name} ({persona_id}) ===")
+        event = f'{name}: 「{text}」'
+        self._log(f"=== {persona.display_name} ({persona_id}) — 对话 ===")
         self._log(f"事件: {event}")
         self.decision_worker = DecisionWorker(DecisionRequest(
             persona=persona,
@@ -635,6 +648,8 @@ class MainWindow(QMainWindow):
             qwen3_url=qwen3_url,
             tts_language=tts_lang,
             subtitle_language=sub_lang,
+            synthesize_frame=False,   # voice chat — no game frame
+            is_conversation=True,
         ))
         self.decision_worker.log.connect(self._log)
         self.decision_worker.finished_ok.connect(self._on_decision_done)

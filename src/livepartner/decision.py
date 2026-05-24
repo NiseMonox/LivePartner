@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from .llm import flash_vision, pro_vision
+from .llm import flash_vision, pro_text, pro_vision
 from .persona import Persona
 
 
@@ -89,9 +89,19 @@ def _parse_bilingual(raw: str) -> tuple[str, str]:
     return ja, zh
 
 
+_CONVERSATION_NOTE = (
+    "\n# 当前模式：语音对话\n"
+    "玩家正在通过 Mumble 和你直接说话,你看不到任何游戏画面 —— 不要假装看到画面、"
+    "不要描述画面、不要把这条当成游戏事件触发。\n"
+    "玩家的话已经写在用户消息里,**必须**直接回应那句话(回答问题/接话/搭腔)。\n"
+    "人格里关于\"只在画面有变化时说话\"、\"大多数时候保持沉默\"之类的规则**临时失效** —— "
+    "玩家点名你必须答,但语气、用词、性格调性继续按人格走。"
+)
+
+
 def generate(
     event_summary: str,
-    frame_b64: str,
+    frame_b64: str | None,
     persona: Persona,
     *,
     memory: str = "",
@@ -100,36 +110,41 @@ def generate(
     bilingual: bool = True,
     tts_language: str = "日语",
     subtitle_language: str = "中文",
+    is_conversation: bool = False,
 ) -> AiReply:
-    """Stage 2: produce the actual line, with vision + full persona.
+    """Stage 2: produce the actual line.
 
-    When bilingual is True (default), the LLM emits one labelled line for the
-    TTS language (Japanese by default) and one for the subtitle language
-    (Chinese by default). When False, a single-language response is used for
-    both fields.
+    If frame_b64 is None, runs a text-only call (no vision). Use this for
+    player-voice triggers — feeding a synthesized YOU DIED frame to an
+    unrelated conversation confuses the model.
+
+    is_conversation=True adds a system note telling the model the input is a
+    direct verbal address (overrides persona's "stay silent" rules).
     """
     system_parts = [persona.system_prompt]
     if memory:
         system_parts.append(f"\n# 记忆\n{memory}")
+    if is_conversation:
+        system_parts.append(_CONVERSATION_NOTE)
 
     if bilingual:
         system_parts.append(_BILINGUAL_FORMAT.format(
             tts_lang=tts_language, sub_lang=subtitle_language,
         ))
     else:
-        # Single-language constraint, mirrors the older path.
         system_parts.append(
             f"\n# 输出约束\n严格不超过 {persona.silence_rules.max_words_per_response} 字。"
             "只输出 AI 要说的那一句话，不要解释、不要旁白、不要引号。"
         )
 
-    out = pro_vision(
-        prompt=f"当前事件: {event_summary}",
-        image_b64=frame_b64,
-        system="".join(system_parts),
-        mime=mime,
-        max_tokens=max_tokens,
-    )
+    system = "".join(system_parts)
+    prompt = event_summary if is_conversation else f"当前事件: {event_summary}"
+
+    if frame_b64 is None:
+        out = pro_text(prompt=prompt, system=system, max_tokens=max_tokens)
+    else:
+        out = pro_vision(prompt=prompt, image_b64=frame_b64, system=system,
+                         mime=mime, max_tokens=max_tokens)
     raw = out.strip()
 
     if bilingual:
@@ -149,8 +164,8 @@ def generate(
 
 def decide(
     event_summary: str,
-    frame_b64: str,
-    thumbnail_b64: str,
+    frame_b64: str | None,
+    thumbnail_b64: str | None,
     persona: Persona,
     *,
     memory: str = "",
@@ -159,13 +174,18 @@ def decide(
     bilingual: bool = True,
     tts_language: str = "日语",
     subtitle_language: str = "中文",
+    is_conversation: bool = False,
 ) -> AiReply | None:
-    if not force_speak and not gate(event_summary, thumbnail_b64, persona, mime=mime):
-        return None
+    if not force_speak:
+        if thumbnail_b64 is None:
+            return None  # no frame, no force → caller must opt-in via force_speak
+        if not gate(event_summary, thumbnail_b64, persona, mime=mime):
+            return None
     return generate(
         event_summary, frame_b64, persona,
         memory=memory, mime=mime,
         bilingual=bilingual,
         tts_language=tts_language,
         subtitle_language=subtitle_language,
+        is_conversation=is_conversation,
     )
