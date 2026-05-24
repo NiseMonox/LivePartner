@@ -48,6 +48,8 @@ from ..tts_qwen3 import (
     list_voices as qwen3_list_voices,
     stream_pcm as qwen3_stream_pcm,
 )
+# stt import is deferred to first use because faster-whisper + ctranslate2 take
+# ~1s on import (CUDA DLL preload) — keeps the UI snappy on cold start.
 
 
 def _synth_you_died_frame(size: tuple[int, int] = (1280, 720)) -> Image.Image:
@@ -89,18 +91,61 @@ class MumbleConnectWorker(QThread):
     connected = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, cfg: MumbleConfig):
+    def __init__(self, cfg: MumbleConfig, on_user_utterance=None):
         super().__init__()
         self.cfg = cfg
+        self.on_user_utterance = on_user_utterance
 
     def run(self) -> None:
         try:
-            bot = MumbleBot(self.cfg)
+            bot = MumbleBot(self.cfg, on_user_utterance=self.on_user_utterance)
             self.log.emit(f"[mumble] connecting to {self.cfg.host}:{self.cfg.port} …")
             bot.start(timeout=8.0)
             self.log.emit(f"[mumble] connected as {self.cfg.name!r}, channel "
                           f"{bot.current_channel_name!r}")
             self.connected.emit(bot)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class STTLoadWorker(QThread):
+    log = Signal(str)
+    loaded = Signal(object)  # STT instance
+    failed = Signal(str)
+
+    def __init__(self, model_size: str, language: str | None):
+        super().__init__()
+        self.model_size = model_size
+        self.language = language
+
+    def run(self) -> None:
+        try:
+            from ..stt import STT
+            self.log.emit(f"[stt] loading whisper-{self.model_size} on cuda …")
+            t0 = time.perf_counter()
+            stt = STT(model_size=self.model_size, language=self.language)
+            stt.warm_load()
+            self.log.emit(f"[stt] loaded in {(time.perf_counter()-t0)*1000:.0f} ms")
+            self.loaded.emit(stt)
+        except Exception as e:
+            self.failed.emit(f"{type(e).__name__}: {e}")
+
+
+class STTTranscribeWorker(QThread):
+    log = Signal(str)
+    transcribed = Signal(str, dict, object)  # text, user_dict, STTResult
+    failed = Signal(str)
+
+    def __init__(self, stt, user: dict, pcm_bytes: bytes):
+        super().__init__()
+        self.stt = stt
+        self.user = user
+        self.pcm = pcm_bytes
+
+    def run(self) -> None:
+        try:
+            r = self.stt.transcribe_pcm(self.pcm, sample_rate=48000)
+            self.transcribed.emit(r.text, dict(self.user), r)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
 
@@ -241,10 +286,13 @@ class MainWindow(QMainWindow):
         "玩家在 boss 战中第三次死亡。画面切换为 YOU DIED 红屏。BGM 转为低沉死亡音乐。"
     )
 
+    # Cross-thread bridge: pymumble's network thread emits this; the slot runs on the UI thread.
+    utterance_signal = Signal(dict, bytes)
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("LivePartner (M1)")
-        self.resize(960, 740)
+        self.resize(960, 820)
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -356,6 +404,31 @@ class MainWindow(QMainWindow):
         mumble_layout.addLayout(mrow2)
         root.addWidget(mumble_box)
 
+        # --- STT panel ---
+        stt_box = QGroupBox("STT 监听玩家")
+        stt_layout = QHBoxLayout(stt_box)
+        stt_layout.addWidget(QLabel("模型:"))
+        self.stt_size_combo = QComboBox()
+        for s in ["tiny", "base", "small", "medium", "large-v3"]:
+            self.stt_size_combo.addItem(s)
+        self.stt_size_combo.setCurrentText("medium")
+        stt_layout.addWidget(self.stt_size_combo)
+        stt_layout.addWidget(QLabel("语种:"))
+        self.stt_lang_combo = QComboBox()
+        for label, code in [("自动", None), ("中文", "zh"), ("日文", "ja"), ("英文", "en")]:
+            self.stt_lang_combo.addItem(label, userData=code)
+        stt_layout.addWidget(self.stt_lang_combo)
+        self.stt_load_btn = QPushButton("加载模型")
+        self.stt_load_btn.clicked.connect(self._on_stt_load)
+        stt_layout.addWidget(self.stt_load_btn)
+        self.stt_listen_check = QCheckBox("监听频道(说啥AI答啥)")
+        self.stt_listen_check.setEnabled(False)
+        stt_layout.addWidget(self.stt_listen_check)
+        self.stt_status = QLabel("(未加载)")
+        self.stt_status.setStyleSheet("color: #888;")
+        stt_layout.addWidget(self.stt_status, stretch=1)
+        root.addWidget(stt_box)
+
         # --- event input + trigger ---
         root.addWidget(QLabel("事件描述："))
         self.event_edit = QLineEdit(self.DEFAULT_EVENT)
@@ -386,6 +459,12 @@ class MainWindow(QMainWindow):
         self.connect_worker: MumbleConnectWorker | None = None
         self.probe_worker: Qwen3ProbeWorker | None = None
         self.bot: MumbleBot | None = None
+        self.stt = None  # populated by STTLoadWorker
+        self.stt_load_worker: STTLoadWorker | None = None
+        self.stt_workers: list[STTTranscribeWorker] = []
+
+        # Bridge: bot callback (network thread) → Qt signal → UI-thread slot
+        self.utterance_signal.connect(self._on_utterance_arrived)
 
         self._on_engine_changed()  # set initial state of qwen3 controls
 
@@ -437,12 +516,122 @@ class MainWindow(QMainWindow):
         self.mumble_connect_btn.setEnabled(False)
         self.mumble_status.setText("连接中…")
         self.mumble_status.setStyleSheet("color: #c80;")
-        self.connect_worker = MumbleConnectWorker(cfg)
+        # Pass a thread-safe forwarder: pymumble callback emits signal that
+        # marshals to the UI thread.
+        self.connect_worker = MumbleConnectWorker(cfg, on_user_utterance=self._bot_utterance_cb)
         self.connect_worker.log.connect(self._log)
         self.connect_worker.connected.connect(self._on_mumble_connected)
         self.connect_worker.failed.connect(self._on_mumble_failed)
         self.connect_worker.finished.connect(self._cleanup_connect_worker)
         self.connect_worker.start()
+
+    # ---------- STT (utterance → transcribe → maybe trigger AI) ----------
+    def _bot_utterance_cb(self, user: dict, pcm_bytes: bytes) -> None:
+        # Called from pymumble's network thread — bounce to UI thread via signal.
+        self.utterance_signal.emit(dict(user), pcm_bytes)
+
+    def _on_utterance_arrived(self, user: dict, pcm_bytes: bytes) -> None:
+        name = user.get("name", "?")
+        size_kb = len(pcm_bytes) // 1024
+        dur = len(pcm_bytes) / (48000 * 2)
+        if self.stt is None:
+            self._log(f"[mumble] heard {name!r} ({size_kb} KB, {dur:.2f}s) — STT not loaded, ignoring")
+            return
+        if not self.stt_listen_check.isChecked():
+            self._log(f"[mumble] heard {name!r} ({dur:.2f}s) — listen toggle off, ignoring")
+            return
+        self._log(f"[stt] {name!r} spoke {dur:.2f}s, transcribing…")
+        w = STTTranscribeWorker(self.stt, user, pcm_bytes)
+        w.log.connect(self._log)
+        w.transcribed.connect(self._on_transcribed)
+        w.failed.connect(lambda m: self._log(f"[stt err] {m}"))
+        w.finished.connect(lambda: self._cleanup_stt_worker(w))
+        self.stt_workers.append(w)
+        w.start()
+
+    def _cleanup_stt_worker(self, w: STTTranscribeWorker) -> None:
+        try:
+            self.stt_workers.remove(w)
+        except ValueError:
+            pass
+
+    def _on_transcribed(self, text: str, user: dict, result) -> None:
+        name = user.get("name", "?")
+        self._log(f"[stt] {name!r} ({result.language} {result.language_probability:.2f}, "
+                  f"{result.inference_ms:.0f}ms): {text!r}")
+        if not text:
+            return
+        # Auto-respond: synthesize a fresh event and run the same decision pipeline
+        # as the manual trigger. force_speak — per SPEC §5.3.2 player voice is a
+        # priority event.
+        if self.decision_worker is not None and self.decision_worker.isRunning():
+            self._log("[stt] AI 还在说上一句,丢弃这一轮")
+            return
+        persona_id = self.persona_combo.currentData()
+        if not persona_id:
+            return
+        try:
+            persona = load_persona(persona_id)
+        except Exception as e:
+            self._log(f"[stt] persona load failed: {e}")
+            return
+        engine = self.tts_engine_combo.currentData() or "edge"
+        qwen3_url = self.qwen3_url_edit.text().strip().rstrip("/")
+        tts_lang = self.tts_lang_combo.currentData() or "Japanese"
+        sub_lang = self.sub_lang_combo.currentData() or "Chinese"
+        event = f"{name} 说话: {text}"
+        self._log(f"=== {persona.display_name} ({persona_id}) ===")
+        self._log(f"事件: {event}")
+        self.decision_worker = DecisionWorker(DecisionRequest(
+            persona=persona,
+            event=event,
+            force_speak=True,  # player voice is always a priority trigger
+            save_mp3=False,
+            bot=self.bot if (self.bot is not None and self.mumble_speak_check.isChecked()) else None,
+            engine=engine,
+            qwen3_url=qwen3_url,
+            tts_language=tts_lang,
+            subtitle_language=sub_lang,
+        ))
+        self.decision_worker.log.connect(self._log)
+        self.decision_worker.finished_ok.connect(self._on_decision_done)
+        self.decision_worker.failed.connect(self._on_decision_failed)
+        self.decision_worker.finished.connect(self._cleanup_decision)
+        self.decision_worker.start()
+
+    def _on_stt_load(self) -> None:
+        if self.stt_load_worker is not None and self.stt_load_worker.isRunning():
+            return
+        size = self.stt_size_combo.currentText()
+        lang = self.stt_lang_combo.currentData()
+        self.stt_load_btn.setEnabled(False)
+        self.stt_status.setText("加载中…")
+        self.stt_status.setStyleSheet("color: #c80;")
+        self.stt_load_worker = STTLoadWorker(size, lang)
+        self.stt_load_worker.log.connect(self._log)
+        self.stt_load_worker.loaded.connect(self._on_stt_loaded)
+        self.stt_load_worker.failed.connect(self._on_stt_failed)
+        self.stt_load_worker.finished.connect(self._cleanup_stt_load_worker)
+        self.stt_load_worker.start()
+
+    def _on_stt_loaded(self, stt_obj: object) -> None:
+        self.stt = stt_obj
+        size = self.stt_size_combo.currentText()
+        self.stt_status.setText(f"已加载 · whisper-{size}")
+        self.stt_status.setStyleSheet("color: #2a2;")
+        self.stt_listen_check.setEnabled(True)
+        self.stt_listen_check.setChecked(True)
+
+    def _on_stt_failed(self, msg: str) -> None:
+        self._log(f"[stt] load FAILED: {msg}")
+        self.stt_status.setText(f"加载失败")
+        self.stt_status.setStyleSheet("color: #c33;")
+        self.stt_load_btn.setEnabled(True)
+
+    def _cleanup_stt_load_worker(self) -> None:
+        self.stt_load_worker = None
+        if self.stt is None:
+            self.stt_load_btn.setEnabled(True)
 
     def _on_mumble_connected(self, bot: object) -> None:
         assert isinstance(bot, MumbleBot)

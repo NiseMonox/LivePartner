@@ -53,6 +53,7 @@ if not hasattr(_ssl, "wrap_socket"):
     _ssl.wrap_socket = _wrap_socket  # type: ignore[attr-defined]
 
 import logging
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -74,16 +75,37 @@ class MumbleConfig:
     reconnect: bool = True
 
 
-# Callback signature: (user_dict, sound_chunk) → None
-# user_dict has session id, name, etc. sound_chunk is pymumble's SoundChunk with .pcm (int16 mono 48k).
+# Per-chunk callback (user_dict, sound_chunk).
 VoiceCallback = Callable[[dict[str, Any], Any], None]
+
+# Per-utterance callback (user_dict, raw 48kHz mono int16 PCM bytes).
+# Fires when the user has been silent for `utterance_silence_ms`.
+UtteranceCallback = Callable[[dict[str, Any], bytes], None]
 
 
 class MumbleBot:
-    def __init__(self, cfg: MumbleConfig, on_user_voice: VoiceCallback | None = None) -> None:
+    def __init__(
+        self,
+        cfg: MumbleConfig,
+        on_user_voice: VoiceCallback | None = None,
+        on_user_utterance: UtteranceCallback | None = None,
+        *,
+        utterance_silence_ms: int = 800,
+        ignore_own_session: bool = True,
+        channel_only: bool = True,
+    ) -> None:
         self.cfg = cfg
         self.on_user_voice = on_user_voice
+        self.on_user_utterance = on_user_utterance
+        self.utterance_silence_ms = utterance_silence_ms
+        self.ignore_own_session = ignore_own_session
+        self.channel_only = channel_only
         self._client: pm.Mumble | None = None
+
+        # Per-user utterance accumulation state.
+        self._utter_buffers: dict[int, bytearray] = {}
+        self._utter_timers: dict[int, threading.Timer] = {}
+        self._utter_lock = threading.Lock()
 
     def start(self, timeout: float = 10.0) -> None:
         c = pm.Mumble(
@@ -94,9 +116,10 @@ class MumbleBot:
             reconnect=self.cfg.reconnect,
         )
         c.set_application_string("LivePartner/0.1")
-        c.set_receive_sound(self.on_user_voice is not None)
-        if self.on_user_voice is not None:
-            c.callbacks.set_callback(PYMUMBLE_CLBK_SOUNDRECEIVED, self.on_user_voice)
+        want_audio = self.on_user_voice is not None or self.on_user_utterance is not None
+        c.set_receive_sound(want_audio)
+        if want_audio:
+            c.callbacks.set_callback(PYMUMBLE_CLBK_SOUNDRECEIVED, self._on_sound)
         c.start()
         c.is_ready()
         deadline = time.monotonic() + timeout
@@ -144,6 +167,92 @@ class MumbleBot:
         ch.move_in()
         log.info("mumble: entered channel %r", name)
 
+    # ---------- audio RX ----------
+    def _on_sound(self, user: dict[str, Any], sound_chunk: Any) -> None:
+        """Single callback registered with pymumble. Dispatches to per-chunk and
+        per-utterance handlers, applies self-filter + channel filter."""
+        if self._client is None:
+            return
+        session = user.get("session") if isinstance(user, dict) else None
+        if session is None:
+            try:
+                session = getattr(user, "session", None)
+            except Exception:
+                session = None
+
+        # Self-filter: never re-ingest the bot's own audio.
+        if self.ignore_own_session:
+            try:
+                me = self._client.users.myself
+                if me is not None and session == me.get("session"):
+                    return
+            except Exception:
+                pass
+
+        # Channel-only filter: skip users in a different channel.
+        if self.channel_only:
+            try:
+                my_ch = self._client.my_channel()
+                user_ch_id = user.get("channel_id") if isinstance(user, dict) else None
+                if my_ch is not None and user_ch_id is not None and user_ch_id != my_ch.get("channel_id"):
+                    return
+            except Exception:
+                pass
+
+        # 1) per-chunk hook.
+        if self.on_user_voice is not None:
+            try:
+                self.on_user_voice(user, sound_chunk)
+            except Exception:
+                log.exception("on_user_voice handler raised")
+
+        # 2) per-utterance accumulator.
+        if self.on_user_utterance is not None and session is not None:
+            pcm = getattr(sound_chunk, "pcm", None)
+            if pcm:
+                self._accumulate(session, pcm, user)
+
+    def _accumulate(self, session: int, pcm: bytes, user: dict[str, Any]) -> None:
+        with self._utter_lock:
+            buf = self._utter_buffers.get(session)
+            if buf is None:
+                buf = bytearray()
+                self._utter_buffers[session] = buf
+            buf.extend(pcm)
+
+            old = self._utter_timers.get(session)
+            if old is not None:
+                old.cancel()
+            t = threading.Timer(
+                self.utterance_silence_ms / 1000.0,
+                self._flush_utterance,
+                args=(session,),
+            )
+            t.daemon = True
+            self._utter_timers[session] = t
+            t.start()
+
+    def _flush_utterance(self, session: int) -> None:
+        with self._utter_lock:
+            buf = self._utter_buffers.pop(session, None)
+            self._utter_timers.pop(session, None)
+        if not buf or self.on_user_utterance is None:
+            return
+        # Look up the user dict by session for the callback's payload.
+        user: dict[str, Any] = {"session": session}
+        try:
+            if self._client is not None:
+                for s, u in self._client.users.items():
+                    if s == session:
+                        user = u
+                        break
+        except Exception:
+            pass
+        try:
+            self.on_user_utterance(user, bytes(buf))
+        except Exception:
+            log.exception("on_user_utterance handler raised")
+
     def send_pcm(self, pcm_bytes: bytes) -> None:
         """Send 48 kHz mono int16 PCM bytes. pymumble handles Opus framing."""
         if self._client is None:
@@ -176,6 +285,15 @@ class MumbleBot:
             return None
 
     def stop(self) -> None:
+        # Cancel any pending utterance timers so they don't fire post-shutdown.
+        with self._utter_lock:
+            for t in self._utter_timers.values():
+                try:
+                    t.cancel()
+                except Exception:
+                    pass
+            self._utter_timers.clear()
+            self._utter_buffers.clear()
         if self._client is not None:
             try:
                 self._client.stop()

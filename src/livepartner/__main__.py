@@ -2,7 +2,25 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+from pathlib import Path
+
+
+def _ensure_cache_dirs_on_d() -> None:
+    """Belt-and-braces: if HF_HOME / UV_CACHE_DIR weren't inherited from the
+    user-level env (PowerShell sometimes misses propagation to existing shells),
+    point them at the repo's D: caches so model downloads don't dribble to C:."""
+    repo = Path(__file__).resolve().parents[2]
+    defaults = {
+        "HF_HOME": str(repo / ".hf-cache"),
+        "HF_HUB_DISABLE_SYMLINKS_WARNING": "1",
+    }
+    for k, v in defaults.items():
+        os.environ.setdefault(k, v)
+
+
+_ensure_cache_dirs_on_d()
 
 
 def main() -> int:
