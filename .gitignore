@@ -51,6 +51,11 @@ demo_*.png
 mumble-server.sqlite
 mumble-server.log
 
+# Third-party clones, model caches — kept on D: but never committed
+external/
+.hf-cache/
+.uv-cache/
+
 # Secrets
 *.key
 .env
