@@ -152,11 +152,17 @@ def generate(
     system = "".join(system_parts)
     prompt = event_summary if is_conversation else f"当前事件: {event_summary}"
 
+    # Disable chain-of-thought reasoning for the generate step too — Qwen3.6
+    # family has thinking ON by default which adds 5-10× latency for what is
+    # essentially a "produce one in-character line" task.
+    extra = {"enable_thinking": False}
+
     if frame_b64 is None:
-        out = pro_text(prompt=prompt, system=system, max_tokens=max_tokens)
+        out = pro_text(prompt=prompt, system=system, max_tokens=max_tokens,
+                       extra_body=extra)
     else:
         out = pro_vision(prompt=prompt, image_b64=frame_b64, system=system,
-                         mime=mime, max_tokens=max_tokens)
+                         mime=mime, max_tokens=max_tokens, extra_body=extra)
     raw = out.strip()
 
     if bilingual:
