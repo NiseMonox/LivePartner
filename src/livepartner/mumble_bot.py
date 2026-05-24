@@ -93,6 +93,7 @@ class MumbleBot:
         utterance_silence_ms: int = 800,
         ignore_own_session: bool = True,
         channel_only: bool = True,
+        voice_whitelist: set[str] | None = None,
     ) -> None:
         self.cfg = cfg
         self.on_user_voice = on_user_voice
@@ -100,12 +101,43 @@ class MumbleBot:
         self.utterance_silence_ms = utterance_silence_ms
         self.ignore_own_session = ignore_own_session
         self.channel_only = channel_only
+        # None = no filter (all users). Otherwise a set of lowercased names.
+        self._voice_whitelist: set[str] | None = (
+            {n.strip().lower() for n in voice_whitelist if n.strip()}
+            if voice_whitelist
+            else None
+        )
         self._client: pm.Mumble | None = None
 
         # Per-user utterance accumulation state.
         self._utter_buffers: dict[int, bytearray] = {}
         self._utter_timers: dict[int, threading.Timer] = {}
         self._utter_lock = threading.Lock()
+
+    def set_voice_whitelist(self, names: set[str] | list[str] | None) -> None:
+        """Live-update the whitelist. None or empty = no filter (all users)."""
+        if not names:
+            self._voice_whitelist = None
+        else:
+            self._voice_whitelist = {n.strip().lower() for n in names if n.strip()}
+        # Drop any in-flight buffers from users that just got filtered out.
+        with self._utter_lock:
+            if self._voice_whitelist is not None and self._client is not None:
+                for session in list(self._utter_buffers):
+                    try:
+                        u = self._client.users.get(session, {})
+                        name = (u.get("name") or "").lower()
+                    except Exception:
+                        name = ""
+                    if name not in self._voice_whitelist:
+                        self._utter_buffers.pop(session, None)
+                        t = self._utter_timers.pop(session, None)
+                        if t is not None:
+                            t.cancel()
+
+    @property
+    def voice_whitelist(self) -> set[str] | None:
+        return set(self._voice_whitelist) if self._voice_whitelist else None
 
     def start(self, timeout: float = 10.0) -> None:
         c = pm.Mumble(
@@ -198,6 +230,14 @@ class MumbleBot:
                     return
             except Exception:
                 pass
+
+        # Whitelist filter: only listen to specific user names.
+        if self._voice_whitelist is not None:
+            name = ""
+            if isinstance(user, dict):
+                name = (user.get("name") or "").lower()
+            if name not in self._voice_whitelist:
+                return
 
         # 1) per-chunk hook.
         if self.on_user_voice is not None:

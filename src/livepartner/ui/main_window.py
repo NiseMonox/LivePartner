@@ -91,14 +91,20 @@ class MumbleConnectWorker(QThread):
     connected = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, cfg: MumbleConfig, on_user_utterance=None):
+    def __init__(self, cfg: MumbleConfig, on_user_utterance=None,
+                 voice_whitelist: set[str] | None = None):
         super().__init__()
         self.cfg = cfg
         self.on_user_utterance = on_user_utterance
+        self.voice_whitelist = voice_whitelist
 
     def run(self) -> None:
         try:
-            bot = MumbleBot(self.cfg, on_user_utterance=self.on_user_utterance)
+            bot = MumbleBot(
+                self.cfg,
+                on_user_utterance=self.on_user_utterance,
+                voice_whitelist=self.voice_whitelist,
+            )
             self.log.emit(f"[mumble] connecting to {self.cfg.host}:{self.cfg.port} …")
             bot.start(timeout=8.0)
             self.log.emit(f"[mumble] connected as {self.cfg.name!r}, channel "
@@ -406,27 +412,42 @@ class MainWindow(QMainWindow):
 
         # --- STT panel ---
         stt_box = QGroupBox("STT 监听玩家")
-        stt_layout = QHBoxLayout(stt_box)
-        stt_layout.addWidget(QLabel("模型:"))
+        stt_outer = QVBoxLayout(stt_box)
+
+        stt_row1 = QHBoxLayout()
+        stt_row1.addWidget(QLabel("模型:"))
         self.stt_size_combo = QComboBox()
         for s in ["tiny", "base", "small", "medium", "large-v3"]:
             self.stt_size_combo.addItem(s)
         self.stt_size_combo.setCurrentText("medium")
-        stt_layout.addWidget(self.stt_size_combo)
-        stt_layout.addWidget(QLabel("语种:"))
+        stt_row1.addWidget(self.stt_size_combo)
+        stt_row1.addWidget(QLabel("语种:"))
         self.stt_lang_combo = QComboBox()
         for label, code in [("自动", None), ("中文", "zh"), ("日文", "ja"), ("英文", "en")]:
             self.stt_lang_combo.addItem(label, userData=code)
-        stt_layout.addWidget(self.stt_lang_combo)
+        stt_row1.addWidget(self.stt_lang_combo)
         self.stt_load_btn = QPushButton("加载模型")
         self.stt_load_btn.clicked.connect(self._on_stt_load)
-        stt_layout.addWidget(self.stt_load_btn)
-        self.stt_listen_check = QCheckBox("监听频道(说啥AI答啥)")
+        stt_row1.addWidget(self.stt_load_btn)
+        self.stt_listen_check = QCheckBox("监听频道")
         self.stt_listen_check.setEnabled(False)
-        stt_layout.addWidget(self.stt_listen_check)
+        stt_row1.addWidget(self.stt_listen_check)
         self.stt_status = QLabel("(未加载)")
         self.stt_status.setStyleSheet("color: #888;")
-        stt_layout.addWidget(self.stt_status, stretch=1)
+        stt_row1.addWidget(self.stt_status, stretch=1)
+        stt_outer.addLayout(stt_row1)
+
+        stt_row2 = QHBoxLayout()
+        stt_row2.addWidget(QLabel("白名单 (逗号分隔,留空=全监听):"))
+        self.stt_whitelist_edit = QLineEdit()
+        self.stt_whitelist_edit.setPlaceholderText("e.g. NiseMono, 朋友A")
+        self.stt_whitelist_edit.editingFinished.connect(self._on_whitelist_changed)
+        stt_row2.addWidget(self.stt_whitelist_edit, stretch=1)
+        self.stt_whitelist_apply_btn = QPushButton("应用")
+        self.stt_whitelist_apply_btn.clicked.connect(self._on_whitelist_changed)
+        stt_row2.addWidget(self.stt_whitelist_apply_btn)
+        stt_outer.addLayout(stt_row2)
+
         root.addWidget(stt_box)
 
         # --- event input + trigger ---
@@ -518,12 +539,31 @@ class MainWindow(QMainWindow):
         self.mumble_status.setStyleSheet("color: #c80;")
         # Pass a thread-safe forwarder: pymumble callback emits signal that
         # marshals to the UI thread.
-        self.connect_worker = MumbleConnectWorker(cfg, on_user_utterance=self._bot_utterance_cb)
+        self.connect_worker = MumbleConnectWorker(
+            cfg,
+            on_user_utterance=self._bot_utterance_cb,
+            voice_whitelist=self._parse_whitelist(),
+        )
         self.connect_worker.log.connect(self._log)
         self.connect_worker.connected.connect(self._on_mumble_connected)
         self.connect_worker.failed.connect(self._on_mumble_failed)
         self.connect_worker.finished.connect(self._cleanup_connect_worker)
         self.connect_worker.start()
+
+    def _parse_whitelist(self) -> set[str] | None:
+        raw = self.stt_whitelist_edit.text().strip()
+        if not raw:
+            return None
+        return {n.strip() for n in raw.split(",") if n.strip()}
+
+    def _on_whitelist_changed(self) -> None:
+        names = self._parse_whitelist()
+        if self.bot is not None:
+            self.bot.set_voice_whitelist(names)
+        if names is None:
+            self._log("[stt] whitelist: (全监听)")
+        else:
+            self._log(f"[stt] whitelist: {sorted(names)}")
 
     # ---------- STT (utterance → transcribe → maybe trigger AI) ----------
     def _bot_utterance_cb(self, user: dict, pcm_bytes: bytes) -> None:
