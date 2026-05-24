@@ -206,10 +206,11 @@ class DecisionWorker(QThread):
             if self.req.captured_frame is not None:
                 snap = self.req.captured_frame
                 h, w = snap.frame.shape[:2]
-                frame_b64, frame_mime = snap.to_vlm_b64(max_side=1024, quality=80)
+                frame_b64, frame_mime = snap.to_vlm_b64()
                 thumb_b64 = snap.thumbnail_png_b64(max_side=256)
                 self.log.emit(
-                    f"frame from capture {w}x{h} → {len(frame_b64)*3//4//1024} KB jpeg  "
+                    f"frame from capture {w}x{h} → "
+                    f"{len(frame_b64)*3//4//1024} KB {frame_mime.split('/')[-1]}  "
                     f"age={time.monotonic()-snap.timestamp:.2f}s"
                 )
             elif self.req.synthesize_frame:

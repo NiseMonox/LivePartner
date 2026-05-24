@@ -55,14 +55,30 @@ class FrameSnapshot:
             raise RuntimeError("cv2.imencode PNG failed")
         return base64.b64encode(buf.tobytes()).decode("ascii")
 
-    def to_vlm_b64(self, max_side: int = 1024, quality: int = 80) -> tuple[str, str]:
-        """Compact JPEG suitable for vision LLM upload — ~50-150 KB typical at
-        max_side=1024 / q=80, vs ~500 KB-1 MB for 1080p PNG. Returns (b64, mime).
+    def to_vlm_b64(
+        self,
+        max_side: int = 768,
+        quality: int = 75,
+        prefer: str = "webp",
+    ) -> tuple[str, str]:
+        """Compact image suitable for vision LLM upload. Returns (b64, mime).
+
+        Defaults tuned for game frames: WebP q=75 at max-side 768. Typical 1080p
+        game frame compresses to ~20-50 KB this way (vs ~500 KB - 1 MB raw PNG
+        and ~100-200 KB JPEG q=80). 768 is close to Qwen Omni's native vision
+        patch grid, so the VLM also has less internal resize to do.
+
+        prefer="webp" tries WebP first and falls back to JPEG if cv2 lacks
+        WebP support. prefer="jpeg" forces JPEG.
         """
         small = self._scaled(max_side)
+        if prefer == "webp":
+            ok, buf = cv2.imencode(".webp", small, [int(cv2.IMWRITE_WEBP_QUALITY), int(quality)])
+            if ok:
+                return base64.b64encode(buf.tobytes()).decode("ascii"), "image/webp"
         ok, buf = cv2.imencode(".jpg", small, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
         if not ok:
-            raise RuntimeError("cv2.imencode JPEG failed")
+            raise RuntimeError("cv2.imencode failed for both webp and jpeg")
         return base64.b64encode(buf.tobytes()).decode("ascii"), "image/jpeg"
 
     def _scaled(self, max_side: int) -> np.ndarray:
