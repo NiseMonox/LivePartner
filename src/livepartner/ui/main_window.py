@@ -725,7 +725,14 @@ class MainWindow(QMainWindow):
         tts_lang = self.tts_lang_combo.currentData() or "Japanese"
         sub_lang = self.sub_lang_combo.currentData() or "Chinese"
         event = f'{name}: 「{text}」'
-        self._log(f"=== {persona.display_name} ({persona_id}) — 对话 ===")
+
+        # If capture is running with a fresh frame, send it along — lets the AI
+        # actually answer "what do you see?"-style voice questions.
+        captured = None
+        if self.capture is not None and self.capture.is_running:
+            captured = self.capture.latest_frame(max_age_sec=1.5)
+
+        self._log(f"=== {persona.display_name} ({persona_id}) — 对话{' + 画面' if captured else ''} ===")
         self._log(f"事件: {event}")
         self.decision_worker = DecisionWorker(DecisionRequest(
             persona=persona,
@@ -739,6 +746,7 @@ class MainWindow(QMainWindow):
             subtitle_language=sub_lang,
             synthesize_frame=False,
             is_conversation=True,
+            captured_frame=captured,
         ))
         self.decision_worker.log.connect(self._log)
         self.decision_worker.finished_ok.connect(self._on_decision_done)

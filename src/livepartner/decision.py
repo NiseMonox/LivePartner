@@ -89,11 +89,20 @@ def _parse_bilingual(raw: str) -> tuple[str, str]:
     return ja, zh
 
 
-_CONVERSATION_NOTE = (
-    "\n# 当前模式：语音对话\n"
+_CONVERSATION_NOTE_NO_FRAME = (
+    "\n# 当前模式：语音对话（无画面）\n"
     "玩家正在通过 Mumble 和你直接说话,你看不到任何游戏画面 —— 不要假装看到画面、"
     "不要描述画面、不要把这条当成游戏事件触发。\n"
     "玩家的话已经写在用户消息里,**必须**直接回应那句话(回答问题/接话/搭腔)。\n"
+    "人格里关于\"只在画面有变化时说话\"、\"大多数时候保持沉默\"之类的规则**临时失效** —— "
+    "玩家点名你必须答,但语气、用词、性格调性继续按人格走。"
+)
+
+_CONVERSATION_NOTE_WITH_FRAME = (
+    "\n# 当前模式：语音对话 + 可看画面\n"
+    "玩家正在通过 Mumble 和你直接说话,**同时**你能看到当前游戏画面(随用户消息附图)。\n"
+    "玩家的话已经写在用户消息里,**必须**直接回应那句话。如果玩家问到画面/游戏内容(\"你看到什么\"、"
+    "\"这是哪儿\"、\"我该往哪走\"…)就**真的看图回答**;如果只是闲聊,可以提一嘴画面也可以不提。\n"
     "人格里关于\"只在画面有变化时说话\"、\"大多数时候保持沉默\"之类的规则**临时失效** —— "
     "玩家点名你必须答,但语气、用词、性格调性继续按人格走。"
 )
@@ -125,7 +134,10 @@ def generate(
     if memory:
         system_parts.append(f"\n# 记忆\n{memory}")
     if is_conversation:
-        system_parts.append(_CONVERSATION_NOTE)
+        system_parts.append(
+            _CONVERSATION_NOTE_WITH_FRAME if frame_b64 is not None
+            else _CONVERSATION_NOTE_NO_FRAME
+        )
 
     if bilingual:
         system_parts.append(_BILINGUAL_FORMAT.format(
