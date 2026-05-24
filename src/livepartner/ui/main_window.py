@@ -281,16 +281,19 @@ class MainWindow(QMainWindow):
         self.tts_engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         tts_row1.addWidget(self.tts_engine_combo)
 
+        # Qwen3-TTS only accepts these English codes (lowercased server-side):
+        # chinese, english, german, italian, portuguese, spanish, japanese, korean, french, russian, auto
         tts_row1.addWidget(QLabel("配音语种:"))
         self.tts_lang_combo = QComboBox()
-        for label, code in [("日语", "日语"), ("中文", "中文"), ("英语", "英语"),
-                            ("韩语", "韩语"), ("法语", "法语")]:
+        for label, code in [("日语", "Japanese"), ("中文", "Chinese"), ("英语", "English"),
+                            ("韩语", "Korean"), ("法语", "French"),
+                            ("德语", "German"), ("自动", "Auto")]:
             self.tts_lang_combo.addItem(label, userData=code)
         tts_row1.addWidget(self.tts_lang_combo)
 
         tts_row1.addWidget(QLabel("字幕语种:"))
         self.sub_lang_combo = QComboBox()
-        for label, code in [("中文", "中文"), ("日语", "日语"), ("英语", "英语")]:
+        for label, code in [("中文", "Chinese"), ("日语", "Japanese"), ("英语", "English")]:
             self.sub_lang_combo.addItem(label, userData=code)
         tts_row1.addWidget(self.sub_lang_combo)
         tts_row1.addStretch()

@@ -25,6 +25,8 @@ def main() -> int:
     ap.add_argument("--url", default="http://127.0.0.1:7001/tts")
     ap.add_argument("--persona", default="snark")
     ap.add_argument("--text", default="第三次寄了？F 键都被你按包浆了吧。")
+    ap.add_argument("--language", default="Chinese",
+                    help="TTS language code (Chinese/Japanese/English/...) or Auto")
     ap.add_argument("--chunk-size", type=int, default=4)
     ap.add_argument("--out", type=Path, default=Path("test_qwen3.wav"))
     args = ap.parse_args()
@@ -32,7 +34,7 @@ def main() -> int:
     body = {
         "persona_id": args.persona,
         "text": args.text,
-        "language": "Chinese",
+        "language": args.language,
         "chunk_size": args.chunk_size,
     }
     print(f"POST {args.url}  body={body}")

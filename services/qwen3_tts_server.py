@@ -158,6 +158,13 @@ class TtsRequest(BaseModel):
     max_new_tokens: int = 2048
 
 
+# Languages the underlying Qwen3-TTS model accepts (config.talker_config.codec_language_id).
+SUPPORTED_LANGUAGES = {
+    "chinese", "english", "german", "italian", "portuguese", "spanish",
+    "japanese", "korean", "french", "russian", "auto",
+}
+
+
 @app.post("/tts")
 def tts(req: TtsRequest):
     if S.model is None:
@@ -167,6 +174,16 @@ def tts(req: TtsRequest):
             404,
             f"voice {req.persona_id!r} not loaded. available: {sorted(S.voices)}",
         )
+    # Normalize + validate language BEFORE we start a streaming response, so callers
+    # get a clean 400 instead of an aborted chunked body.
+    lang_normalized = req.language.strip().lower()
+    if lang_normalized not in SUPPORTED_LANGUAGES:
+        raise HTTPException(
+            400,
+            f"language {req.language!r} not supported. accepted (case-insensitive): "
+            f"{sorted(SUPPORTED_LANGUAGES)}",
+        )
+    req_language = lang_normalized
     spk_emb = S.voices[req.persona_id]
     vcp = dict(
         ref_code=[None],
@@ -182,7 +199,7 @@ def tts(req: TtsRequest):
         total_samples_out = 0
         for audio_chunk, sr, timing in S.model.generate_voice_clone_streaming(
             text=req.text,
-            language=req.language,
+            language=req_language,
             voice_clone_prompt=vcp,
             chunk_size=req.chunk_size,
             temperature=req.temperature,
