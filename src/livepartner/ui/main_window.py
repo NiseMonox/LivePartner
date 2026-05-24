@@ -50,6 +50,11 @@ from ..tts_qwen3 import (
 # stt is imported lazily by STTLoadWorker
 
 
+# Substrings (lowercase, any-match) used to auto-pick a sensible default capture
+# device on this machine. Edit if you swap cards.
+_PREFERRED_CAPTURE_DEVICE_HINTS = ("live gamer ultra", "elgato hd60", "avermedia")
+
+
 def _synth_you_died_frame(size: tuple[int, int] = (1280, 720)) -> Image.Image:
     w, h = size
     img = Image.new("RGB", (w, h), color=(40, 6, 6))
@@ -397,10 +402,11 @@ class MainWindow(QMainWindow):
         self.cap_device_combo = QComboBox()
         for i, name in enumerate(list_video_devices()):
             self.cap_device_combo.addItem(f"[{i}] {name}", userData=i)
+        self._select_preferred_capture_device()
         row.addWidget(self.cap_device_combo, stretch=1)
         row.addWidget(QLabel("分辨率:"))
         self.cap_res_combo = QComboBox()
-        for w, h in [(1280, 720), (1920, 1080), (640, 360)]:
+        for w, h in [(1920, 1080), (1280, 720), (640, 360)]:
             self.cap_res_combo.addItem(f"{w}x{h}", userData=(w, h))
         row.addWidget(self.cap_res_combo)
         self.cap_start_btn = QPushButton("启动")
@@ -815,12 +821,22 @@ class MainWindow(QMainWindow):
         self.cap_device_combo.clear()
         for i, name in enumerate(list_video_devices()):
             self.cap_device_combo.addItem(f"[{i}] {name}", userData=i)
-        # Try to keep previous selection.
+        # Try to keep previous selection; otherwise re-apply default heuristic.
         if prev is not None:
             for idx in range(self.cap_device_combo.count()):
                 if self.cap_device_combo.itemData(idx) == prev:
                     self.cap_device_combo.setCurrentIndex(idx)
-                    break
+                    return
+        self._select_preferred_capture_device()
+
+    def _select_preferred_capture_device(self) -> None:
+        """Bias selection toward a real capture card (e.g. Live Gamer Ultra)
+        instead of whatever virtual cam happens to be at index 0."""
+        for idx in range(self.cap_device_combo.count()):
+            label = (self.cap_device_combo.itemText(idx) or "").lower()
+            if any(hint in label for hint in _PREFERRED_CAPTURE_DEVICE_HINTS):
+                self.cap_device_combo.setCurrentIndex(idx)
+                return
 
     def _update_preview(self) -> None:
         if self.capture is None or not self.capture.is_running:
