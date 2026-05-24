@@ -44,7 +44,12 @@ logs/
 demo_*.mp3
 demo_*.wav
 demo_*.png
+*.tmp
 .git_commit_msg.tmp
+
+# Mumble dev server data
+mumble-server.sqlite
+mumble-server.log
 
 # Secrets
 *.key
