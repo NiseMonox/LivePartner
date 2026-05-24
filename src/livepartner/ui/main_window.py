@@ -256,7 +256,10 @@ class DecisionWorker(QThread):
         for chunk in qwen3_stream_pcm(text, self.req.persona, cfg=cfg):
             if first_ms is None:
                 first_ms = (time.perf_counter() - t0) * 1000
-                target = "Mumble" if self.req.bot else "(dropped, no Mumble)"
+                if self.req.bot is not None:
+                    target = f"Mumble 频道 {self.req.bot.current_channel_name!r}"
+                else:
+                    target = "(丢弃 — 没连 Mumble 或'AI 通过 Mumble 说话'未勾)"
                 self.log.emit(f"[qwen3] TTFB {first_ms:.0f} ms → streaming to {target}")
             total += len(chunk)
             if self.req.bot is not None:
@@ -681,6 +684,9 @@ class MainWindow(QMainWindow):
         self.mumble_status.setStyleSheet("color: #2a2;")
         self.mumble_disconnect_btn.setEnabled(True)
         self.mumble_speak_check.setEnabled(True)
+        # Re-check on every connect — otherwise a previous disconnect leaves the
+        # checkbox unchecked, and AI silently "speaks" into the void.
+        self.mumble_speak_check.setChecked(True)
 
     def _on_mumble_failed(self, msg: str) -> None:
         self._log(f"[mumble] connect FAILED: {msg}")
