@@ -1,13 +1,9 @@
-"""Minimal M1 main window per SPEC §13.
+"""LivePartner main window — tabbed layout.
 
-Provides:
-  - persona dropdown
-  - editable event description (manual trigger source)
-  - TTS engine selection: Edge TTS (cloud) or Qwen3 (local server)
-  - Mumble connect/disconnect with status, so the bot stays present in a channel
-    and AI lines play live through Mumble while connected
-  - "Trigger" button → runs gate→generate→TTS on a synthesized YOU DIED frame
-  - live log of pipeline timings + AI output
+Tabs:
+  - 运行    : persona pick, event input, trigger, log, AI last line
+  - 采集卡  : capture device selection + live preview (~10 fps)
+  - 语音    : TTS engine + Mumble connection + STT settings
 """
 from __future__ import annotations
 
@@ -17,9 +13,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import cv2
 from PIL import Image, ImageDraw, ImageFont
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QFont
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QFont, QImage, QPixmap
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -31,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -49,8 +47,7 @@ from ..tts_qwen3 import (
     list_voices as qwen3_list_voices,
     stream_pcm as qwen3_stream_pcm,
 )
-# stt import is deferred to first use because faster-whisper + ctranslate2 take
-# ~1s on import (CUDA DLL preload) — keeps the UI snappy on cold start.
+# stt is imported lazily by STTLoadWorker
 
 
 def _synth_you_died_frame(size: tuple[int, int] = (1280, 720)) -> Image.Image:
@@ -117,7 +114,7 @@ class MumbleConnectWorker(QThread):
 
 class STTLoadWorker(QThread):
     log = Signal(str)
-    loaded = Signal(object)  # STT instance
+    loaded = Signal(object)
     failed = Signal(str)
 
     def __init__(self, model_size: str, language: str | None):
@@ -140,7 +137,7 @@ class STTLoadWorker(QThread):
 
 class STTTranscribeWorker(QThread):
     log = Signal(str)
-    transcribed = Signal(str, dict, object)  # text, user_dict, STTResult
+    transcribed = Signal(str, dict, object)
     failed = Signal(str)
 
     def __init__(self, stt, user: dict, pcm_bytes: bytes):
@@ -157,20 +154,36 @@ class STTTranscribeWorker(QThread):
             self.failed.emit(f"{type(e).__name__}: {e}")
 
 
+class Qwen3ProbeWorker(QThread):
+    done = Signal(bool, list, str)
+
+    def __init__(self, url: str):
+        super().__init__()
+        self.url = url
+
+    def run(self) -> None:
+        try:
+            alive = qwen3_is_alive(self.url, timeout=1.5)
+            voices = qwen3_list_voices(self.url) if alive else []
+            self.done.emit(alive, voices, self.url)
+        except Exception as e:
+            self.done.emit(False, [], f"{type(e).__name__}: {e}")
+
+
 @dataclass
 class DecisionRequest:
     persona: Persona
     event: str
     force_speak: bool
-    save_mp3: bool                   # save Edge TTS mp3 to demo_tts.mp3
-    bot: MumbleBot | None            # if set, also stream PCM through it
-    engine: str                      # "edge" or "qwen3"
-    qwen3_url: str                   # base url for qwen3 server when engine=qwen3
-    tts_language: str                # voice language, e.g. "日语" / "中文" / "英语"
-    subtitle_language: str           # display language, e.g. "中文"
-    synthesize_frame: bool = True    # fallback synthesize YOU DIED if no live frame available
-    is_conversation: bool = False    # voice chat — tells the LLM to drop "stay silent" rules
-    captured_frame: FrameSnapshot | None = None  # live frame from capture card, if any
+    save_mp3: bool
+    bot: MumbleBot | None
+    engine: str
+    qwen3_url: str
+    tts_language: str
+    subtitle_language: str
+    synthesize_frame: bool = True
+    is_conversation: bool = False
+    captured_frame: FrameSnapshot | None = None
 
 
 class DecisionWorker(QThread):
@@ -212,7 +225,6 @@ class DecisionWorker(QThread):
                 dt_gate = (time.perf_counter() - t0) * 1000
                 self.log.emit(f"[gate] speak={speak}  ({dt_gate:.0f} ms)")
             else:
-                # No frame, no force — refuse to invent intent for the AI.
                 self.log.emit("[gate] no frame + not forced → silent")
                 self.finished_ok.emit("")
                 return
@@ -246,7 +258,6 @@ class DecisionWorker(QThread):
             else:
                 self._tts_edge(reply.tts_text)
 
-            # UI displays the subtitle (Chinese), so emit reply.text not tts_text.
             self.finished_ok.emit(reply.text)
         except Exception as e:
             self.failed.emit(f"{type(e).__name__}: {e}")
@@ -291,23 +302,6 @@ class DecisionWorker(QThread):
                       f"(RTF {dur_s / (dt/1000):.2f})")
 
 
-class Qwen3ProbeWorker(QThread):
-    """Quick async check of qwen3 server: alive + voice list."""
-    done = Signal(bool, list, str)  # alive, voices, error_or_url
-
-    def __init__(self, url: str):
-        super().__init__()
-        self.url = url
-
-    def run(self) -> None:
-        try:
-            alive = qwen3_is_alive(self.url, timeout=1.5)
-            voices = qwen3_list_voices(self.url) if alive else []
-            self.done.emit(alive, voices, self.url)
-        except Exception as e:
-            self.done.emit(False, [], f"{type(e).__name__}: {e}")
-
-
 # ---------- main window ----------
 
 
@@ -316,18 +310,46 @@ class MainWindow(QMainWindow):
         "玩家在 boss 战中第三次死亡。画面切换为 YOU DIED 红屏。BGM 转为低沉死亡音乐。"
     )
 
-    # Cross-thread bridge: pymumble's network thread emits this; the slot runs on the UI thread.
     utterance_signal = Signal(dict, bytes)
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("LivePartner (M1)")
-        self.resize(960, 820)
+        self.resize(1100, 800)
 
-        central = QWidget()
-        root = QVBoxLayout(central)
+        # Mutable state holders — must exist before tab builders reference them.
+        self.decision_worker: DecisionWorker | None = None
+        self.connect_worker: MumbleConnectWorker | None = None
+        self.probe_worker: Qwen3ProbeWorker | None = None
+        self.bot: MumbleBot | None = None
+        self.stt = None
+        self.stt_load_worker: STTLoadWorker | None = None
+        self.stt_workers: list[STTTranscribeWorker] = []
+        self.capture: CaptureSource | None = None
 
-        # --- persona + options row ---
+        tabs = QTabWidget()
+        tabs.addTab(self._build_run_tab(), "运行")
+        tabs.addTab(self._build_capture_tab(), "采集卡")
+        tabs.addTab(self._build_audio_tab(), "语音 / TTS / Mumble")
+        self.setCentralWidget(tabs)
+        self.statusBar().showMessage("就绪")
+
+        # Cross-thread bridge: pymumble callback → Qt signal → UI thread slot.
+        self.utterance_signal.connect(self._on_utterance_arrived)
+
+        # Preview timer (~10 fps).
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setInterval(100)
+        self.preview_timer.timeout.connect(self._update_preview)
+        self.preview_timer.start()
+
+        self._on_engine_changed()
+
+    # ---------- tab builders ----------
+    def _build_run_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("人格:"))
         self.persona_combo = QComboBox()
@@ -342,25 +364,91 @@ class MainWindow(QMainWindow):
         self.force_check.setChecked(True)
         row1.addWidget(self.force_check)
         self.save_mp3_check = QCheckBox("保存 demo_tts.mp3 (Edge)")
-        self.save_mp3_check.setChecked(False)
         row1.addWidget(self.save_mp3_check)
-        root.addLayout(row1)
+        layout.addLayout(row1)
 
-        # --- TTS panel ---
+        layout.addWidget(QLabel("事件描述："))
+        self.event_edit = QLineEdit(self.DEFAULT_EVENT)
+        layout.addWidget(self.event_edit)
+        self.trigger_btn = QPushButton("触发一次 AI 反应")
+        self.trigger_btn.clicked.connect(self._on_trigger)
+        layout.addWidget(self.trigger_btn)
+
+        layout.addWidget(QLabel("日志："))
+        self.log_view = QTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setFont(QFont("Consolas", 10))
+        layout.addWidget(self.log_view, stretch=1)
+
+        layout.addWidget(QLabel("AI 最近一句："))
+        self.last_line_lbl = QLabel("(尚未生成)")
+        self.last_line_lbl.setFont(QFont("Microsoft YaHei", 14, QFont.Weight.Bold))
+        self.last_line_lbl.setWordWrap(True)
+        self.last_line_lbl.setStyleSheet("color: #c33; padding: 8px;")
+        layout.addWidget(self.last_line_lbl)
+        return page
+
+    def _build_capture_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("设备:"))
+        self.cap_device_combo = QComboBox()
+        for i, name in enumerate(list_video_devices()):
+            self.cap_device_combo.addItem(f"[{i}] {name}", userData=i)
+        row.addWidget(self.cap_device_combo, stretch=1)
+        row.addWidget(QLabel("分辨率:"))
+        self.cap_res_combo = QComboBox()
+        for w, h in [(1280, 720), (1920, 1080), (640, 360)]:
+            self.cap_res_combo.addItem(f"{w}x{h}", userData=(w, h))
+        row.addWidget(self.cap_res_combo)
+        self.cap_start_btn = QPushButton("启动")
+        self.cap_start_btn.clicked.connect(self._on_capture_start)
+        row.addWidget(self.cap_start_btn)
+        self.cap_stop_btn = QPushButton("停止")
+        self.cap_stop_btn.clicked.connect(self._on_capture_stop)
+        self.cap_stop_btn.setEnabled(False)
+        row.addWidget(self.cap_stop_btn)
+        self.cap_refresh_btn = QPushButton("刷新设备")
+        self.cap_refresh_btn.clicked.connect(self._on_capture_refresh_devices)
+        row.addWidget(self.cap_refresh_btn)
+        layout.addLayout(row)
+
+        status_row = QHBoxLayout()
+        status_row.addWidget(QLabel("状态:"))
+        self.cap_status = QLabel("(未启动)")
+        self.cap_status.setStyleSheet("color: #888;")
+        status_row.addWidget(self.cap_status, stretch=1)
+        self.cap_info_lbl = QLabel("")
+        self.cap_info_lbl.setStyleSheet("color: #888;")
+        status_row.addWidget(self.cap_info_lbl)
+        layout.addLayout(status_row)
+
+        # Big preview area.
+        self.preview_label = QLabel("(未启动)")
+        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_label.setStyleSheet("background: #111; color: #888; border: 1px solid #444;")
+        self.preview_label.setMinimumSize(640, 360)
+        layout.addWidget(self.preview_label, stretch=1)
+
+        return page
+
+    def _build_audio_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        # --- TTS ---
         tts_box = QGroupBox("TTS 引擎")
         tts_outer = QVBoxLayout(tts_box)
-
         tts_row1 = QHBoxLayout()
         tts_row1.addWidget(QLabel("引擎:"))
         self.tts_engine_combo = QComboBox()
         self.tts_engine_combo.addItem("Edge TTS (云,免费)", userData="edge")
         self.tts_engine_combo.addItem("Qwen3-TTS (本地,克隆)", userData="qwen3")
-        self.tts_engine_combo.setCurrentIndex(1)  # default to Qwen3 now that voices are trained
+        self.tts_engine_combo.setCurrentIndex(1)
         self.tts_engine_combo.currentIndexChanged.connect(self._on_engine_changed)
         tts_row1.addWidget(self.tts_engine_combo)
-
-        # Qwen3-TTS only accepts these English codes (lowercased server-side):
-        # chinese, english, german, italian, portuguese, spanish, japanese, korean, french, russian, auto
         tts_row1.addWidget(QLabel("配音语种:"))
         self.tts_lang_combo = QComboBox()
         for label, code in [("日语", "Japanese"), ("中文", "Chinese"), ("英语", "English"),
@@ -368,7 +456,6 @@ class MainWindow(QMainWindow):
                             ("德语", "German"), ("自动", "Auto")]:
             self.tts_lang_combo.addItem(label, userData=code)
         tts_row1.addWidget(self.tts_lang_combo)
-
         tts_row1.addWidget(QLabel("字幕语种:"))
         self.sub_lang_combo = QComboBox()
         for label, code in [("中文", "Chinese"), ("日语", "Japanese"), ("英语", "English")]:
@@ -376,11 +463,10 @@ class MainWindow(QMainWindow):
         tts_row1.addWidget(self.sub_lang_combo)
         tts_row1.addStretch()
         tts_outer.addLayout(tts_row1)
-
         tts_row2 = QHBoxLayout()
         tts_row2.addWidget(QLabel("Qwen3 URL:"))
         self.qwen3_url_edit = QLineEdit(QWEN3_DEFAULT_URL)
-        self.qwen3_url_edit.setMaximumWidth(240)
+        self.qwen3_url_edit.setMaximumWidth(260)
         tts_row2.addWidget(self.qwen3_url_edit)
         self.qwen3_probe_btn = QPushButton("检测")
         self.qwen3_probe_btn.clicked.connect(self._on_probe_qwen3)
@@ -389,35 +475,9 @@ class MainWindow(QMainWindow):
         self.qwen3_status.setStyleSheet("color: #888;")
         tts_row2.addWidget(self.qwen3_status, stretch=1)
         tts_outer.addLayout(tts_row2)
+        layout.addWidget(tts_box)
 
-        root.addWidget(tts_box)
-
-        # --- Capture panel ---
-        cap_box = QGroupBox("采集卡 (HDMI 视频)")
-        cap_layout = QHBoxLayout(cap_box)
-        cap_layout.addWidget(QLabel("设备:"))
-        self.cap_device_combo = QComboBox()
-        for i, name in enumerate(list_video_devices()):
-            self.cap_device_combo.addItem(f"[{i}] {name}", userData=i)
-        cap_layout.addWidget(self.cap_device_combo, stretch=1)
-        cap_layout.addWidget(QLabel("分辨率:"))
-        self.cap_res_combo = QComboBox()
-        for w, h in [(1280, 720), (1920, 1080), (640, 360)]:
-            self.cap_res_combo.addItem(f"{w}x{h}", userData=(w, h))
-        cap_layout.addWidget(self.cap_res_combo)
-        self.cap_start_btn = QPushButton("启动")
-        self.cap_start_btn.clicked.connect(self._on_capture_start)
-        cap_layout.addWidget(self.cap_start_btn)
-        self.cap_stop_btn = QPushButton("停止")
-        self.cap_stop_btn.clicked.connect(self._on_capture_stop)
-        self.cap_stop_btn.setEnabled(False)
-        cap_layout.addWidget(self.cap_stop_btn)
-        self.cap_status = QLabel("(未启动)")
-        self.cap_status.setStyleSheet("color: #888;")
-        cap_layout.addWidget(self.cap_status, stretch=1)
-        root.addWidget(cap_box)
-
-        # --- Mumble panel ---
+        # --- Mumble ---
         mumble_box = QGroupBox("Mumble")
         mumble_layout = QVBoxLayout(mumble_box)
         mrow1 = QHBoxLayout()
@@ -440,7 +500,6 @@ class MainWindow(QMainWindow):
         mrow1.addWidget(self.mumble_channel)
         mrow1.addStretch()
         mumble_layout.addLayout(mrow1)
-
         mrow2 = QHBoxLayout()
         self.mumble_connect_btn = QPushButton("连接 Mumble")
         self.mumble_connect_btn.clicked.connect(self._on_connect_mumble)
@@ -457,12 +516,11 @@ class MainWindow(QMainWindow):
         self.mumble_speak_check.setEnabled(False)
         mrow2.addWidget(self.mumble_speak_check)
         mumble_layout.addLayout(mrow2)
-        root.addWidget(mumble_box)
+        layout.addWidget(mumble_box)
 
-        # --- STT panel ---
+        # --- STT ---
         stt_box = QGroupBox("STT 监听玩家")
         stt_outer = QVBoxLayout(stt_box)
-
         stt_row1 = QHBoxLayout()
         stt_row1.addWidget(QLabel("模型:"))
         self.stt_size_combo = QComboBox()
@@ -485,7 +543,6 @@ class MainWindow(QMainWindow):
         self.stt_status.setStyleSheet("color: #888;")
         stt_row1.addWidget(self.stt_status, stretch=1)
         stt_outer.addLayout(stt_row1)
-
         stt_row2 = QHBoxLayout()
         stt_row2.addWidget(QLabel("白名单 (逗号分隔,留空=全监听):"))
         self.stt_whitelist_edit = QLineEdit()
@@ -496,48 +553,10 @@ class MainWindow(QMainWindow):
         self.stt_whitelist_apply_btn.clicked.connect(self._on_whitelist_changed)
         stt_row2.addWidget(self.stt_whitelist_apply_btn)
         stt_outer.addLayout(stt_row2)
+        layout.addWidget(stt_box)
 
-        root.addWidget(stt_box)
-
-        # --- event input + trigger ---
-        root.addWidget(QLabel("事件描述："))
-        self.event_edit = QLineEdit(self.DEFAULT_EVENT)
-        root.addWidget(self.event_edit)
-        self.trigger_btn = QPushButton("触发一次 AI 反应（合成 YOU DIED 帧）")
-        self.trigger_btn.clicked.connect(self._on_trigger)
-        root.addWidget(self.trigger_btn)
-
-        # --- log + last line ---
-        root.addWidget(QLabel("日志："))
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont("Consolas", 10))
-        root.addWidget(self.log_view, stretch=1)
-
-        last_lbl = QLabel("AI 最近一句：")
-        self.last_line_lbl = QLabel("(尚未生成)")
-        self.last_line_lbl.setFont(QFont("Microsoft YaHei", 14, QFont.Weight.Bold))
-        self.last_line_lbl.setWordWrap(True)
-        self.last_line_lbl.setStyleSheet("color: #c33; padding: 8px;")
-        root.addWidget(last_lbl)
-        root.addWidget(self.last_line_lbl)
-
-        self.setCentralWidget(central)
-        self.statusBar().showMessage("就绪")
-
-        self.decision_worker: DecisionWorker | None = None
-        self.connect_worker: MumbleConnectWorker | None = None
-        self.probe_worker: Qwen3ProbeWorker | None = None
-        self.bot: MumbleBot | None = None
-        self.stt = None  # populated by STTLoadWorker
-        self.stt_load_worker: STTLoadWorker | None = None
-        self.stt_workers: list[STTTranscribeWorker] = []
-        self.capture: CaptureSource | None = None
-
-        # Bridge: bot callback (network thread) → Qt signal → UI-thread slot
-        self.utterance_signal.connect(self._on_utterance_arrived)
-
-        self._on_engine_changed()  # set initial state of qwen3 controls
+        layout.addStretch()
+        return page
 
     # ---------- logging ----------
     def _log(self, msg: str) -> None:
@@ -587,8 +606,6 @@ class MainWindow(QMainWindow):
         self.mumble_connect_btn.setEnabled(False)
         self.mumble_status.setText("连接中…")
         self.mumble_status.setStyleSheet("color: #c80;")
-        # Pass a thread-safe forwarder: pymumble callback emits signal that
-        # marshals to the UI thread.
         self.connect_worker = MumbleConnectWorker(
             cfg,
             on_user_utterance=self._bot_utterance_cb,
@@ -599,6 +616,42 @@ class MainWindow(QMainWindow):
         self.connect_worker.failed.connect(self._on_mumble_failed)
         self.connect_worker.finished.connect(self._cleanup_connect_worker)
         self.connect_worker.start()
+
+    def _on_mumble_connected(self, bot: object) -> None:
+        assert isinstance(bot, MumbleBot)
+        self.bot = bot
+        ch = bot.current_channel_name or "(unknown)"
+        self.mumble_status.setText(f"已连接 · 频道 {ch!r}")
+        self.mumble_status.setStyleSheet("color: #2a2;")
+        self.mumble_disconnect_btn.setEnabled(True)
+        self.mumble_speak_check.setEnabled(True)
+        self.mumble_speak_check.setChecked(True)
+
+    def _on_mumble_failed(self, msg: str) -> None:
+        self._log(f"[mumble] connect FAILED: {msg}")
+        self.mumble_status.setText("连接失败")
+        self.mumble_status.setStyleSheet("color: #c33;")
+        self.mumble_connect_btn.setEnabled(True)
+
+    def _cleanup_connect_worker(self) -> None:
+        self.connect_worker = None
+        if self.bot is None:
+            self.mumble_connect_btn.setEnabled(True)
+
+    def _on_disconnect_mumble(self) -> None:
+        if self.bot is not None:
+            self._log("[mumble] disconnecting")
+            try:
+                self.bot.stop()
+            except Exception as e:
+                self._log(f"[mumble] stop error: {e}")
+            self.bot = None
+        self.mumble_status.setText("未连接")
+        self.mumble_status.setStyleSheet("color: #888;")
+        self.mumble_connect_btn.setEnabled(True)
+        self.mumble_disconnect_btn.setEnabled(False)
+        self.mumble_speak_check.setChecked(False)
+        self.mumble_speak_check.setEnabled(False)
 
     def _parse_whitelist(self) -> set[str] | None:
         raw = self.stt_whitelist_edit.text().strip()
@@ -615,9 +668,8 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"[stt] whitelist: {sorted(names)}")
 
-    # ---------- STT (utterance → transcribe → maybe trigger AI) ----------
+    # ---------- STT ----------
     def _bot_utterance_cb(self, user: dict, pcm_bytes: bytes) -> None:
-        # Called from pymumble's network thread — bounce to UI thread via signal.
         self.utterance_signal.emit(dict(user), pcm_bytes)
 
     def _on_utterance_arrived(self, user: dict, pcm_bytes: bytes) -> None:
@@ -651,9 +703,6 @@ class MainWindow(QMainWindow):
                   f"{result.inference_ms:.0f}ms): {text!r}")
         if not text:
             return
-        # Auto-respond: synthesize a fresh event and run the same decision pipeline
-        # as the manual trigger. force_speak — per SPEC §5.3.2 player voice is a
-        # priority event.
         if self.decision_worker is not None and self.decision_worker.isRunning():
             self._log("[stt] AI 还在说上一句,丢弃这一轮")
             return
@@ -675,14 +724,14 @@ class MainWindow(QMainWindow):
         self.decision_worker = DecisionWorker(DecisionRequest(
             persona=persona,
             event=event,
-            force_speak=True,  # player voice is always a priority trigger
+            force_speak=True,
             save_mp3=False,
             bot=self.bot if (self.bot is not None and self.mumble_speak_check.isChecked()) else None,
             engine=engine,
             qwen3_url=qwen3_url,
             tts_language=tts_lang,
             subtitle_language=sub_lang,
-            synthesize_frame=False,   # voice chat — no game frame
+            synthesize_frame=False,
             is_conversation=True,
         ))
         self.decision_worker.log.connect(self._log)
@@ -716,7 +765,7 @@ class MainWindow(QMainWindow):
 
     def _on_stt_failed(self, msg: str) -> None:
         self._log(f"[stt] load FAILED: {msg}")
-        self.stt_status.setText(f"加载失败")
+        self.stt_status.setText("加载失败")
         self.stt_status.setStyleSheet("color: #c33;")
         self.stt_load_btn.setEnabled(True)
 
@@ -738,7 +787,7 @@ class MainWindow(QMainWindow):
             cap = CaptureSource(device_index=int(dev), width=w, height=h, fps=30)
             cap.start()
         except Exception as e:
-            self.cap_status.setText(f"启动失败")
+            self.cap_status.setText("启动失败")
             self.cap_status.setStyleSheet("color: #c33;")
             self._log(f"[capture] {type(e).__name__}: {e}")
             return
@@ -756,47 +805,50 @@ class MainWindow(QMainWindow):
             self.capture = None
         self.cap_status.setText("(未启动)")
         self.cap_status.setStyleSheet("color: #888;")
+        self.cap_info_lbl.setText("")
         self.cap_start_btn.setEnabled(True)
         self.cap_stop_btn.setEnabled(False)
         self._log("[capture] stopped")
 
-    def _on_mumble_connected(self, bot: object) -> None:
-        assert isinstance(bot, MumbleBot)
-        self.bot = bot
-        ch = bot.current_channel_name or "(unknown)"
-        self.mumble_status.setText(f"已连接 · 频道 {ch!r}")
-        self.mumble_status.setStyleSheet("color: #2a2;")
-        self.mumble_disconnect_btn.setEnabled(True)
-        self.mumble_speak_check.setEnabled(True)
-        # Re-check on every connect — otherwise a previous disconnect leaves the
-        # checkbox unchecked, and AI silently "speaks" into the void.
-        self.mumble_speak_check.setChecked(True)
+    def _on_capture_refresh_devices(self) -> None:
+        prev = self.cap_device_combo.currentData()
+        self.cap_device_combo.clear()
+        for i, name in enumerate(list_video_devices()):
+            self.cap_device_combo.addItem(f"[{i}] {name}", userData=i)
+        # Try to keep previous selection.
+        if prev is not None:
+            for idx in range(self.cap_device_combo.count()):
+                if self.cap_device_combo.itemData(idx) == prev:
+                    self.cap_device_combo.setCurrentIndex(idx)
+                    break
 
-    def _on_mumble_failed(self, msg: str) -> None:
-        self._log(f"[mumble] connect FAILED: {msg}")
-        self.mumble_status.setText("连接失败")
-        self.mumble_status.setStyleSheet("color: #c33;")
-        self.mumble_connect_btn.setEnabled(True)
-
-    def _cleanup_connect_worker(self) -> None:
-        self.connect_worker = None
-        if self.bot is None:
-            self.mumble_connect_btn.setEnabled(True)
-
-    def _on_disconnect_mumble(self) -> None:
-        if self.bot is not None:
-            self._log("[mumble] disconnecting")
-            try:
-                self.bot.stop()
-            except Exception as e:
-                self._log(f"[mumble] stop error: {e}")
-            self.bot = None
-        self.mumble_status.setText("未连接")
-        self.mumble_status.setStyleSheet("color: #888;")
-        self.mumble_connect_btn.setEnabled(True)
-        self.mumble_disconnect_btn.setEnabled(False)
-        self.mumble_speak_check.setChecked(False)
-        self.mumble_speak_check.setEnabled(False)
+    def _update_preview(self) -> None:
+        if self.capture is None or not self.capture.is_running:
+            if self.preview_label.pixmap() and not self.preview_label.pixmap().isNull():
+                self.preview_label.setPixmap(QPixmap())
+            self.preview_label.setText("(未启动)")
+            return
+        snap = self.capture.latest_frame(max_age_sec=2.0)
+        if snap is None:
+            self.preview_label.setText("(等待信号 / 帧太老)")
+            self.preview_label.setPixmap(QPixmap())
+            return
+        h, w = snap.frame.shape[:2]
+        # BGR → RGB → QImage. copy() because numpy buffer would be reused.
+        rgb = cv2.cvtColor(snap.frame, cv2.COLOR_BGR2RGB)
+        rgb = rgb.copy()
+        qimg = QImage(rgb.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+        target_w = max(320, self.preview_label.width() - 4)
+        target_h = max(180, self.preview_label.height() - 4)
+        pix = QPixmap.fromImage(qimg).scaled(
+            target_w, target_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.preview_label.setPixmap(pix)
+        self.cap_info_lbl.setText(
+            f"{w}x{h}  ·  mean brightness {snap.frame.mean():.0f}  ·  age {time.monotonic() - snap.timestamp:.2f}s"
+        )
 
     # ---------- Decision ----------
     def _on_trigger(self) -> None:
@@ -816,8 +868,8 @@ class MainWindow(QMainWindow):
 
         engine = self.tts_engine_combo.currentData() or "edge"
         qwen3_url = self.qwen3_url_edit.text().strip().rstrip("/")
-        tts_lang = self.tts_lang_combo.currentData() or "日语"
-        sub_lang = self.sub_lang_combo.currentData() or "中文"
+        tts_lang = self.tts_lang_combo.currentData() or "Japanese"
+        sub_lang = self.sub_lang_combo.currentData() or "Chinese"
 
         captured = None
         if self.capture is not None and self.capture.is_running:
@@ -869,6 +921,8 @@ class MainWindow(QMainWindow):
 
     # ---------- shutdown ----------
     def closeEvent(self, ev) -> None:
+        if self.preview_timer.isActive():
+            self.preview_timer.stop()
         if self.capture is not None:
             try:
                 self.capture.stop()
