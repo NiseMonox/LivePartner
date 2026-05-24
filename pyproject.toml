@@ -14,6 +14,10 @@ dependencies = [
     "Pillow>=10.0",
     "edge-tts>=6.1",
     "PySide6>=6.7",
+    # Audio pipeline (M1: Mumble bot)
+    "pymumble>=1.6",
+    "miniaudio>=1.7",      # mp3 decode + resample, no system ffmpeg needed
+    "pyogg>=0.6.14a1",     # ships opus.dll on Windows so opuslib can find it
 ]
 
 [project.optional-dependencies]
@@ -23,9 +27,6 @@ capture = [
     "sounddevice>=0.5",
     "pygrabber>=0.2",
     "numpy>=1.26",
-]
-voice = [
-    "pymumble>=1.6",
 ]
 signals = [
     "scikit-image>=0.24",
