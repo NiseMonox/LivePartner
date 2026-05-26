@@ -156,6 +156,11 @@ class TtsRequest(BaseModel):
     temperature: float = 0.9
     top_k: int = 50
     max_new_tokens: int = 2048
+    # Natural-language style/prosody hint, prepended as a user instruction turn.
+    # E.g. "请用兴奋的语气说" / "低沉无奈地说" / "轻笑着说". None = neutral.
+    # Officially this is experimental in x-vector-only mode but in practice it
+    # does steer prosody, just not as reliably as ICL mode.
+    instruct: Optional[str] = None
 
 
 # Languages the underlying Qwen3-TTS model accepts (config.talker_config.codec_language_id).
@@ -192,6 +197,10 @@ def tts(req: TtsRequest):
         icl_mode=[False],
     )
 
+    instruct = (req.instruct or "").strip() or None
+    if instruct:
+        print(f"[tts] instruct: {instruct!r}", flush=True)
+
     def gen():
         t0 = time.perf_counter()
         first = True
@@ -205,6 +214,7 @@ def tts(req: TtsRequest):
             temperature=req.temperature,
             top_k=req.top_k,
             max_new_tokens=req.max_new_tokens,
+            instruct=instruct,
         ):
             if first:
                 ttfb_ms = (time.perf_counter() - t0) * 1000

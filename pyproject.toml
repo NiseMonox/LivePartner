@@ -18,6 +18,7 @@ dependencies = [
     "pymumble>=1.6",
     "miniaudio>=1.7",      # mp3 decode + resample, no system ffmpeg needed
     "pyogg>=0.6.14a1",     # ships opus.dll on Windows so opuslib can find it
+    "cryptography>=42",
 ]
 
 [project.optional-dependencies]
@@ -34,6 +35,16 @@ signals = [
 dev = [
     "pytest>=8",
     "ruff>=0.6",
+]
+# Live 2D avatar via VTube Studio + pyvts. Optional — if VTS isn't installed
+# or pyvts import fails, LivePartner runs unchanged minus the avatar layer.
+vts = [
+    "pyvts>=0.3.3",
+]
+# Live streaming integration: read 弹幕 from Bilibili live rooms and feed
+# them as utterances. Optional — without it the "直播" tab is informational only.
+danmaku = [
+    "bilibili-api-python>=17",
 ]
 
 [build-system]

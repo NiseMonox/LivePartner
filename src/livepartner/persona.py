@@ -37,6 +37,9 @@ class Persona:
     silence_rules: SilenceRules
     trigger_bias: dict[str, float] = field(default_factory=dict)
     vts: dict[str, Any] = field(default_factory=dict)
+    # How chatty the persona naturally is. Steers the gate's yes/no bias.
+    # Values: "chatty" / "balanced" / "quiet". Default balanced.
+    chat_style: str = "balanced"
 
 
 def load_persona(persona_id: str, *, directory: Path | None = None) -> Persona:
@@ -54,6 +57,7 @@ def load_persona(persona_id: str, *, directory: Path | None = None) -> Persona:
         silence_rules=SilenceRules(**(data.get("silence_rules") or {})),
         trigger_bias=dict(data.get("trigger_bias") or {}),
         vts=dict(data.get("vts") or {}),
+        chat_style=data.get("chat_style", "balanced"),
     )
 
 

@@ -24,10 +24,16 @@ def chat(
     mime: str = "image/png",
     max_tokens: int = 300,
     extra_body: dict[str, Any] | None = None,
+    temperature: float | None = None,
+    presence_penalty: float | None = None,
+    frequency_penalty: float | None = None,
 ) -> str:
     """One call surface for everything: text-only or vision, flash or pro.
 
-    extra_body lets callers pass DashScope-specific params (e.g. enable_thinking=False).
+    extra_body lets callers pass DashScope-specific params (e.g.
+    enable_thinking=False). ``temperature`` / ``presence_penalty`` /
+    ``frequency_penalty`` are forwarded as top-level params when provided;
+    leave as None to use the model's default.
     """
     messages: list[dict[str, Any]] = []
     if system:
@@ -45,6 +51,12 @@ def chat(
     extra: dict[str, Any] = {}
     if extra_body:
         extra["extra_body"] = extra_body
+    if temperature is not None:
+        extra["temperature"] = temperature
+    if presence_penalty is not None:
+        extra["presence_penalty"] = presence_penalty
+    if frequency_penalty is not None:
+        extra["frequency_penalty"] = frequency_penalty
 
     resp = client().chat.completions.create(
         model=model,

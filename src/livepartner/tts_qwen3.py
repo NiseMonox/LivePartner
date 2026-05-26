@@ -29,6 +29,11 @@ class Qwen3TtsConfig:
     top_k: int = 50
     language: str = "Chinese"
     timeout: float = 60.0
+    # ~12 codec steps ≈ 1 second of audio. 384 caps at ~32s — already plenty
+    # for Eri's 25-char lines, but tight enough that a runaway/looping model
+    # can't burn 60+ seconds of GPU on one request (which on parallel calls
+    # had been crashing the TTS server). Real lines hit 80-150 tokens.
+    max_new_tokens: int = 384
 
 
 def is_alive(base_url: str = DEFAULT_BASE_URL, *, timeout: float = 1.5) -> bool:
@@ -60,8 +65,14 @@ def stream_pcm(
     persona: Persona,
     *,
     cfg: Optional[Qwen3TtsConfig] = None,
+    instruct: Optional[str] = None,
 ) -> Iterator[bytes]:
-    """POST /tts and yield 48kHz mono int16 PCM bytes as they arrive."""
+    """POST /tts and yield 48kHz mono int16 PCM bytes as they arrive.
+
+    ``instruct`` is a natural-language prosody hint passed to the server's
+    ``instruct=`` (e.g. ``"请用激动的语气朗读"`` / ``"低沉无奈地说"``). None =
+    neutral, matches previous default.
+    """
     cfg = cfg or Qwen3TtsConfig()
     body = {
         "persona_id": voice_id_for(persona),
@@ -70,7 +81,10 @@ def stream_pcm(
         "chunk_size": cfg.chunk_size,
         "temperature": cfg.temperature,
         "top_k": cfg.top_k,
+        "max_new_tokens": cfg.max_new_tokens,
     }
+    if instruct:
+        body["instruct"] = instruct
     with httpx.stream("POST", f"{cfg.base_url}/tts", json=body, timeout=cfg.timeout) as r:
         r.raise_for_status()
         for chunk in r.iter_bytes(chunk_size=8192):

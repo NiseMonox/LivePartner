@@ -40,6 +40,9 @@ personas/user_*.yaml
 *.log
 logs/
 
+# Memory store — per-player chat history + curated md files
+.memory/
+
 # Demo / scratch artifacts
 demo_*.mp3
 demo_*.wav

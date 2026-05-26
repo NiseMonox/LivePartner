@@ -73,6 +73,16 @@ class MumbleConfig:
     password: str = ""
     channel: str = "LivePartner"
     reconnect: bool = True
+    # If True (default, for local self-hosted), MumbleBot creates the channel
+    # when missing. Public servers usually deny channel creation — set False
+    # there to skip the attempt; bot stays in Root if channel not found.
+    create_channel_if_missing: bool = True
+    # PEM file paths for TLS client cert. If left None, MumbleBot.start()
+    # auto-generates a persistent self-signed cert under .memory/identity/.
+    # A cert gives Eri a stable Mumble identity so per-user volume / mute /
+    # comment settings on other clients survive reconnects.
+    certfile: str | None = None
+    keyfile: str | None = None
 
 
 # Per-chunk callback (user_dict, sound_chunk).
@@ -115,8 +125,16 @@ class MumbleBot:
         self._utter_lock = threading.Lock()
 
     def set_voice_whitelist(self, names: set[str] | list[str] | None) -> None:
-        """Live-update the whitelist. None or empty = no filter (all users)."""
-        if not names:
+        """Live-update the whitelist.
+
+        - ``None`` → no filter (all users pass)
+        - empty set/list (``set()`` / ``[]``) → BLOCK ALL (no user passes)
+        - non-empty → only listed names pass
+
+        We intentionally distinguish ``None`` from ``set()`` so UI can fully
+        gate audio intake (e.g. when the "listen" toggle is off).
+        """
+        if names is None:
             self._voice_whitelist = None
         else:
             self._voice_whitelist = {n.strip().lower() for n in names if n.strip()}
@@ -140,12 +158,25 @@ class MumbleBot:
         return set(self._voice_whitelist) if self._voice_whitelist else None
 
     def start(self, timeout: float = 10.0) -> None:
+        certfile = self.cfg.certfile
+        keyfile = self.cfg.keyfile
+        if not certfile or not keyfile:
+            from ._mumble_cert import cert_fingerprint_sha256, ensure_cert
+            cp, kp = ensure_cert(self.cfg.name)
+            certfile, keyfile = str(cp), str(kp)
+            try:
+                fp = cert_fingerprint_sha256(cp)
+                log.info("mumble: client cert %s (sha256 %s)", cp, fp)
+            except Exception:
+                log.info("mumble: client cert %s", cp)
         c = pm.Mumble(
             host=self.cfg.host,
             user=self.cfg.name,
             port=self.cfg.port,
             password=self.cfg.password,
             reconnect=self.cfg.reconnect,
+            certfile=certfile,
+            keyfile=keyfile,
         )
         c.set_application_string("LivePartner/0.1")
         want_audio = self.on_user_voice is not None or self.on_user_utterance is not None
@@ -182,6 +213,12 @@ class MumbleBot:
 
         ch = _safe_find()
         if ch is None:
+            if not self.cfg.create_channel_if_missing:
+                log.info(
+                    "mumble: channel %r not found and create_channel_if_missing=False; "
+                    "staying in Root (public-server mode)", name,
+                )
+                return
             try:
                 self._client.channels.new_channel(0, name)
             except Exception as e:
@@ -298,6 +335,22 @@ class MumbleBot:
         if self._client is None:
             raise RuntimeError("MumbleBot not started")
         self._client.sound_output.add_sound(pcm_bytes)
+
+    def flush_tx(self) -> None:
+        """Drop all PCM still buffered in pymumble's sound_output.
+
+        Used to interrupt the bot mid-utterance — e.g. when the player starts
+        talking and we want Eri to shut up immediately instead of stepping on
+        them. Already-sent Opus packets can't be unsent (they're on the wire),
+        so there's still a tail of ~20-40ms of audio in the receiver's jitter
+        buffer, but anything that hasn't been encoded yet stops here.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.sound_output.clear_buffer()
+        except Exception:
+            log.exception("flush_tx: clear_buffer failed")
 
     def wait_until_silent(self, max_wait: float = 30.0, poll: float = 0.1) -> None:
         """Block until the TX queue is empty or max_wait elapses."""
